@@ -6,12 +6,15 @@ import asyncio
 import logging
 import ssl
 import time
+from collections import Counter
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any
 
 import aiohttp
 import certifi
 
+from src.filters import UrlFilter, normalize_url
 from src.models import (
     ERROR_HTTP,
     ERROR_NETWORK,
@@ -21,10 +24,17 @@ from src.models import (
     FetchResult,
 )
 from src.parser import HTMLParser, empty_page
+from src.queue import CrawlerQueue
+from src.semaphore import SemaphoreManager
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 64 * 1024
+
+SKIP_DEPTH = "depth"
+SKIP_FILTERED = "filtered"
+SKIP_DUPLICATE = "duplicate"
+SKIP_CLOSED = "closed"
 
 
 def _default_ssl_context() -> ssl.SSLContext:
@@ -48,6 +58,8 @@ class AsyncCrawler:
         self,
         max_concurrent: int = 10,
         *,
+        max_depth: int = 2,
+        max_per_domain: int | None = None,
         timeout_total: float = 15.0,
         timeout_connect: float = 5.0,
         timeout_read: float = 10.0,
@@ -58,8 +70,11 @@ class AsyncCrawler:
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent должен быть >= 1")
+        if max_depth < 0:
+            raise ValueError("max_depth должен быть >= 0")
 
         self.max_concurrent = max_concurrent
+        self.max_depth = max_depth
         self.max_body_bytes = max_body_bytes
         self.user_agent = user_agent
         self.parser = parser or HTMLParser()
@@ -69,11 +84,23 @@ class AsyncCrawler:
             connect=timeout_connect,
             sock_read=timeout_read,
         )
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self.semaphores = SemaphoreManager(max_concurrent, max_per_domain)
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
         self.results: list[FetchResult] = []
         self.stats = CrawlStats()
+
+        # Состояние обхода (день 3). `visited_urls` — URL, которые действительно
+        # забрали из очереди и загрузили; за дедупликацию отвечает очередь,
+        # её `seen` — надмножество этого набора.
+        self.queue = CrawlerQueue()
+        self.visited_urls: set[str] = set()
+        self.failed_urls: dict[str, str] = {}
+        self.processed_urls: dict[str, dict[str, Any]] = {}
+        self.skipped: Counter[str] = Counter()
+        # Адреса, с которых страницы реально отдали (после редиректов).
+        self._final_urls: set[str] = set()
+        self._pages_started = 0
 
     async def __aenter__(self) -> AsyncCrawler:
         return self
@@ -98,7 +125,9 @@ class AsyncCrawler:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
                 limit=self.max_concurrent * 2,
-                limit_per_host=self.max_concurrent,
+                # Пул соединений не должен быть уже лимита семафора на домен,
+                # иначе он, а не семафор, определял бы конкурентность.
+                limit_per_host=self.semaphores.max_per_domain,
                 ttl_dns_cache=300,
                 ssl=self._ssl_context,
             )
@@ -110,7 +139,7 @@ class AsyncCrawler:
             logger.debug(
                 "Создана сессия: limit=%d, limit_per_host=%d",
                 self.max_concurrent * 2,
-                self.max_concurrent,
+                self.semaphores.max_per_domain,
             )
 
         return self._session
@@ -119,7 +148,7 @@ class AsyncCrawler:
         """Загружает один URL и всегда возвращает результат, не поднимая исключений."""
         session = self._get_session()
 
-        async with self._semaphore:
+        async with self.semaphores.acquire(url):
             # Время измеряется после семафора: ожидание в очереди — не время запроса.
             started = time.perf_counter()
             logger.info("Загрузка начата: %s", url)
@@ -363,6 +392,289 @@ class AsyncCrawler:
             elapsed,
         )
         return pages
+
+    async def crawl(
+        self,
+        start_urls: list[str],
+        max_pages: int = 100,
+        *,
+        max_depth: int | None = None,
+        same_domain_only: bool = False,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        progress_interval: float = 0.5,
+    ) -> list[dict[str, Any]]:
+        """Обходит сайт от стартовых URL, добавляя найденные ссылки в очередь.
+
+        Работу делает пул из `max_concurrent` воркеров: каждый берёт URL из
+        очереди, загружает, разбирает и ставит найденные ссылки обратно. Такая
+        схема, в отличие от обхода «волнами по уровням», не оставляет воркеры
+        простаивать в конце уровня.
+
+        Возвращает список страниц в порядке завершения загрузки — включая те,
+        что не загрузились (у них `ok=False`).
+        """
+        if max_pages < 1:
+            raise ValueError("max_pages должен быть >= 1")
+
+        if self._closed:
+            raise RuntimeError("Краулер уже закрыт, создайте новый экземпляр")
+
+        depth_limit = self.max_depth if max_depth is None else max_depth
+        # Нормализация до фильтра: иначе `https://Example.com` и
+        # `https://example.com/` задали бы разные «разрешённые» домены.
+        seeds = [normalize_url(url) for url in self._unique(start_urls)]
+        url_filter = UrlFilter.build(
+            seeds,
+            same_domain_only=same_domain_only,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+
+        self.queue = CrawlerQueue()
+        self.visited_urls = set()
+        self.failed_urls = {}
+        self.processed_urls = {}
+        self.skipped = Counter()
+        self._final_urls = set()
+        self.results = []
+        self._pages_started = 0
+        # Семафоры переиспользуются между обходами, но их пики — нет: иначе
+        # второй обход показывал бы статистику первого.
+        self.semaphores.reset_stats()
+        pages: list[dict[str, Any]] = []
+
+        for url in seeds:
+            # Стартовые URL не проходят фильтр по домену: именно они его и задают.
+            self.queue.add_url(url, priority=0, depth=0)
+
+        logger.info(
+            "Обход начат: %d стартовых URL, max_pages=%d, max_depth=%d, "
+            "воркеров %d",
+            len(self.queue.seen),
+            max_pages,
+            depth_limit,
+            self.max_concurrent,
+        )
+
+        started = time.perf_counter()
+        if on_progress is not None:
+            # Стартовая строка сразу: на быстром сайте обход может закончиться
+            # раньше первого тика, и прогресс не показался бы вовсе.
+            self._report_progress(on_progress)
+        ticker = self._start_progress_ticker(on_progress, progress_interval)
+        workers = [
+            asyncio.create_task(
+                self._crawl_worker(pages, url_filter, max_pages, depth_limit, number),
+                name=f"crawl-worker-{number}",
+            )
+            for number in range(self.max_concurrent)
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            # gather не отменяет соседей сам, а оставлять воркеры работать в
+            # фоне после выхода из crawl нельзя.
+            self.queue.close()
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        finally:
+            await self._stop_progress_ticker(ticker, on_progress)
+
+        self.stats = CrawlStats.from_results(
+            self.results, time.perf_counter() - started
+        )
+        logger.info(
+            "Обход завершён: страниц %d, ошибок %d, в очереди осталось %d, %.2f с",
+            len(self.processed_urls),
+            len(self.failed_urls),
+            len(self.queue),
+            self.stats.elapsed,
+        )
+        return pages
+
+    async def _crawl_worker(
+        self,
+        pages: list[dict[str, Any]],
+        url_filter: UrlFilter,
+        max_pages: int,
+        max_depth: int,
+        number: int,
+    ) -> None:
+        """Тянет URL из очереди, пока она не опустеет или не закроется."""
+        queue = self.queue
+        while True:
+            url = await queue.get_next()
+            if url is None:
+                logger.debug("Воркер %d: работы больше нет", number)
+                return
+
+            if url in self._final_urls:
+                # Эту страницу уже загружали под другим адресом: о редиректе
+                # становится известно только после загрузки, и ссылка на цель
+                # могла попасть в очередь раньше.
+                logger.debug("URL ведёт на уже загруженную страницу: %s", url)
+                self.skipped[SKIP_DUPLICATE] += 1
+                queue.mark_skipped(url)
+                continue
+
+            # Проверка и инкремент без await между ними, поэтому лимит страниц
+            # соблюдается точно, без перебора на число воркеров.
+            if self._pages_started >= max_pages:
+                logger.info(
+                    "Достигнут лимит %d страниц, обход останавливается", max_pages
+                )
+                queue.mark_skipped(url)
+                queue.close()
+                return
+            self._pages_started += 1
+
+            depth = queue.depth_of(url)
+            marked = False
+            try:
+                try:
+                    result, page = await self._fetch_and_parse(url)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # падение воркера не должно рвать обход
+                    result = self._unexpected(url, exc)
+                    page = self._merge_result(empty_page(url), result)
+
+                page["depth"] = depth
+                self.visited_urls.add(url)
+                self.results.append(result)
+                pages.append(page)
+
+                if result.ok:
+                    self.processed_urls[url] = page
+                    self._remember_redirect(url, result)
+                    # Ссылки добавляются до mark_*: иначе последний работающий
+                    # воркер на мгновение создал бы «очередь пуста и все
+                    # свободны», и остальные вышли бы, не дождавшись новых URL.
+                    self._enqueue_links(page, url_filter, depth, max_depth)
+                    queue.mark_processed(url)
+                else:
+                    error = result.error or "неизвестная ошибка"
+                    self.failed_urls[url] = error
+                    queue.mark_failed(url, error)
+                marked = True
+            finally:
+                if not marked:
+                    # Иначе in_progress остался бы завышенным, и остальные
+                    # воркеры ждали бы работу, которой больше не будет.
+                    queue.mark_skipped(url)
+
+    def _remember_redirect(self, url: str, result: FetchResult) -> None:
+        """Запоминает адрес, с которого реально отдали страницу.
+
+        Нужно для редиректов: ссылку на цель не поставят в очередь, а если она
+        попала туда раньше — воркер её пропустит. Неизбежным остаётся только
+        случай, когда редирект и его цель загружаются одновременно: до ответа
+        сервера об этом знать нельзя.
+        """
+        final = normalize_url(result.final_url or url)
+        self._final_urls.add(final)
+        if final != url and self.queue.add_alias(final):
+            logger.debug("Редирект %s -> %s, цель не будет загружена повторно", url, final)
+
+    def _enqueue_links(
+        self,
+        page: dict[str, Any],
+        url_filter: UrlFilter,
+        depth: int,
+        max_depth: int,
+    ) -> None:
+        """Ставит в очередь ссылки страницы, отсекая глубину, фильтр и дубликаты."""
+        next_depth = depth + 1
+        links: list[str] = page.get("links") or []
+
+        if self.queue.closed:
+            # Лимит страниц исчерпан: очередь больше ничего не принимает, и
+            # списывать эти ссылки на дубликаты было бы неправдой.
+            self.skipped[SKIP_CLOSED] += len(links)
+            return
+
+        if next_depth > max_depth:
+            if links:
+                self.skipped[SKIP_DEPTH] += len(links)
+                logger.debug(
+                    "Глубина %d исчерпана, %d ссылок не добавлено: %s",
+                    max_depth,
+                    len(links),
+                    page.get("url"),
+                )
+            return
+
+        added = 0
+        for raw_link in links:
+            link = normalize_url(raw_link)
+            if (reason := url_filter.reject_reason(link)) is not None:
+                self.skipped[SKIP_FILTERED] += 1
+                logger.debug("Ссылка отклонена (%s): %s", reason, link)
+                continue
+            # priority = -глубина: мелкие уровни разбираются раньше, обход
+            # получается почти BFS, но воркеры не ждут конца уровня.
+            if self.queue.add_url(link, priority=-next_depth, depth=next_depth):
+                added += 1
+            else:
+                self.skipped[SKIP_DUPLICATE] += 1
+
+        if added:
+            logger.debug(
+                "Добавлено %d ссылок с глубины %d: %s", added, next_depth, page.get("url")
+            )
+
+    def _start_progress_ticker(
+        self,
+        on_progress: Callable[[dict[str, Any]], None] | None,
+        interval: float,
+    ) -> asyncio.Task[None] | None:
+        """Запускает задачу, которая периодически отдаёт статистику наружу."""
+        if on_progress is None or interval <= 0:
+            return None
+
+        async def tick() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                self._report_progress(on_progress)
+
+        return asyncio.create_task(tick(), name="crawl-progress")
+
+    async def _stop_progress_ticker(
+        self,
+        ticker: asyncio.Task[None] | None,
+        on_progress: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        if ticker is not None:
+            ticker.cancel()
+            # Дождаться отмены, чтобы задача не пережила сам обход.
+            await asyncio.gather(ticker, return_exceptions=True)
+        if on_progress is not None:
+            self._report_progress(on_progress)  # финальные цифры
+
+    def _report_progress(
+        self, on_progress: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """Вызывает callback прогресса, не позволяя ему сорвать обход."""
+        try:
+            on_progress(self.get_crawl_stats())
+        except Exception as exc:
+            logger.warning("Callback прогресса упал: %s: %s", type(exc).__name__, exc)
+
+    def get_crawl_stats(self) -> dict[str, Any]:
+        """Сводная статистика обхода: очередь, семафоры и причины пропусков."""
+        stats = self.queue.get_stats()
+        stats.update(
+            visited=len(self.visited_urls),
+            pages_started=self._pages_started,
+            skipped=dict(self.skipped),
+            skipped_total=sum(self.skipped.values()),
+            semaphores=self.semaphores.get_stats(),
+        )
+        return stats
 
     async def close(self) -> None:
         """Закрывает сессию; повторный вызов безопасен."""

@@ -68,6 +68,20 @@ BROKEN_BODY = """<html><body><p>Текст без закрытия
 <ul><li>пункт
 </body>&&&<<>>"""
 
+# Граф сайта для тестов обхода: ветвление, цикл назад, битая страница и ссылка
+# на чужой домен.
+SITE_LINKS: dict[str, list[str]] = {
+    "/site/": ["/site/a", "/site/b", "/site/missing", EXTERNAL_LINK],
+    # /site/redirect ведёт на /site/b1, на который есть и прямая ссылка:
+    # цель редиректа не должна загружаться дважды.
+    "/site/a": ["/site/a1", "/site/"],
+    "/site/b": ["/site/b1", "/site/redirect"],
+    "/site/a1": [],
+    "/site/b1": [],
+}
+REDIRECT_PATH = "/site/redirect"
+REDIRECT_TARGET = "/site/b1"
+
 
 async def handle_ok(request: web.Request) -> web.Response:
     return web.Response(text=OK_BODY, content_type="text/html")
@@ -123,6 +137,27 @@ async def handle_counted(request: web.Request) -> web.Response:
     return web.Response(text="counted")
 
 
+async def handle_redirect(request: web.Request) -> web.Response:
+    """Перенаправляет на страницу, на которую есть и прямая ссылка."""
+    raise web.HTTPFound(REDIRECT_TARGET)
+
+
+async def handle_site(request: web.Request) -> web.Response:
+    """Страница графа `SITE_LINKS`, считающая обращения к себе."""
+    path = request.path
+    links = SITE_LINKS.get(path)
+    if links is None:
+        return web.Response(status=404, text=f"нет такой страницы: {path}")
+
+    request.app[HITS_KEY][path] += 1
+    anchors = "".join(f'<a href="{link}">{link}</a>\n' for link in links)
+    body = (
+        f"<html><head><title>Страница {path}</title></head>"
+        f"<body><h1>{path}</h1>{anchors}</body></html>"
+    )
+    return web.Response(text=body, content_type="text/html")
+
+
 @pytest.fixture
 async def server() -> AsyncIterator[TestServer]:
     """Поднимает aiohttp-приложение на случайном порту на время теста."""
@@ -137,6 +172,9 @@ async def server() -> AsyncIterator[TestServer]:
     app.router.add_get("/page", handle_page)
     app.router.add_get("/broken", handle_broken)
     app.router.add_get("/empty", handle_empty)
+    app.router.add_get("/site/", handle_site)
+    app.router.add_get(REDIRECT_PATH, handle_redirect)
+    app.router.add_get("/site/{page}", handle_site)
 
     test_server = TestServer(app)
     await test_server.start_server()

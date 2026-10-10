@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from src.models import CrawlStats, FetchResult
+
+logger = logging.getLogger(__name__)
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -132,6 +137,94 @@ def format_parse_stats(pages: list[dict[str, Any]]) -> str:
         f"изображений {images}, текста {text} симв. "
         f"(в среднем {text // len(parsed)} на страницу)"
     )
+
+
+def format_progress(stats: dict[str, Any]) -> str:
+    """Строка прогресса обхода: что сделано, что осталось, с какой скоростью."""
+    return (
+        f"Страниц: {stats.get('processed', 0)}"
+        f" | в очереди: {stats.get('pending', 0)}"
+        f" | в работе: {stats.get('in_progress', 0)}"
+        f" | ошибок: {stats.get('failed', 0)}"
+        f" | {stats.get('pages_per_sec', 0.0):.1f} стр/с"
+        f" | глубина: {stats.get('max_depth_reached', 0)}"
+    )
+
+
+def print_progress(stats: dict[str, Any]) -> None:
+    """Показывает прогресс обхода: в терминале — строкой на месте.
+
+    Возврат каретки годится только для терминала: в файле или пайпе все
+    обновления склеились бы в одну строку, поэтому там каждое печатается
+    отдельно. Печать идёт в stdout, а логи — в stderr, так что при
+    перенаправлении вывода они не перемешиваются.
+    """
+    line = format_progress(stats)
+    if sys.stdout.isatty():
+        # Хвост из пробелов затирает остаток предыдущей, более длинной строки.
+        sys.stdout.write(f"\r{line}   ")
+    else:
+        sys.stdout.write(f"{line}\n")
+    sys.stdout.flush()
+
+
+def format_crawl_stats(stats: dict[str, Any], title: str = "Итог обхода") -> str:
+    """Многострочная сводка после обхода: страницы, пропуски, семафоры."""
+    skipped: dict[str, int] = stats.get("skipped") or {}
+    semaphores: dict[str, Any] = stats.get("semaphores") or {}
+    peak_by_host: dict[str, int] = semaphores.get("peak_by_host") or {}
+
+    lines = [
+        f"{title}:",
+        f"  Загружено страниц: {stats.get('processed', 0)}"
+        f" | ошибок: {stats.get('failed', 0)}"
+        f" | осталось в очереди: {stats.get('pending', 0)}",
+        f"  Найдено URL: {stats.get('seen', 0)}"
+        f" | максимальная глубина: {stats.get('max_depth_reached', 0)}"
+        f" | время: {stats.get('elapsed', 0.0):.2f} с"
+        f" | {stats.get('pages_per_sec', 0.0):.1f} стр/с",
+    ]
+
+    if skipped or stats.get("skipped_duplicates"):
+        parts = [f"{name}={count}" for name, count in sorted(skipped.items())]
+        parts.append(f"дубликатов в очереди={stats.get('skipped_duplicates', 0)}")
+        lines.append(f"  Пропущено ссылок: {', '.join(parts)}")
+
+    if semaphores:
+        lines.append(
+            f"  Конкурентность: лимит {semaphores.get('max_concurrent')}"
+            f" (на домен {semaphores.get('max_per_domain')})"
+            f", пик {semaphores.get('peak_active', 0)}"
+            f", домены {semaphores.get('hosts', 0)}"
+        )
+    for host, peak in sorted(peak_by_host.items(), key=lambda item: -item[1])[:3]:
+        lines.append(f"    {host}: пик {peak}")
+
+    return "\n".join(lines)
+
+
+def save_crawl_results(
+    pages: list[dict[str, Any]],
+    stats: dict[str, Any],
+    path: str | Path,
+) -> Path:
+    """Сохраняет страницы и статистику обхода в один JSON-файл.
+
+    Намеренно простой синхронный `json.dump`: полноценный слой сохранения
+    (потоковая запись, форматы, база данных) — тема дня 5.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "stats": stats,
+        "pages_count": len(pages),
+        "pages": pages,
+    }
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+    logger.info("Результаты обхода сохранены: %s (%d страниц)", target, len(pages))
+    return target
 
 
 def _shorten(text: str, limit: int) -> str:
