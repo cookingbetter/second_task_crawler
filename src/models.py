@@ -21,6 +21,8 @@ class FetchResult:
     error: str | None = None
     error_type: str | None = None
     truncated: bool = False
+    # URL после редиректов: именно он служит базой для относительных ссылок.
+    final_url: str | None = None
 
     @property
     def ok(self) -> bool:

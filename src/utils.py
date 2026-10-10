@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from src.models import CrawlStats, FetchResult
 
@@ -72,3 +73,66 @@ def format_results_table(results: list[FetchResult]) -> str:
         lines.append(f"{url:<45} {status:<8} {result.elapsed:>7.2f}s  {details}")
 
     return "\n".join(lines)
+
+
+def format_page_summary(page: dict[str, Any], *, max_links: int = 5) -> str:
+    """Собирает читаемую сводку по одной разобранной странице."""
+    lines = [f"URL: {page.get('url', '')}"]
+
+    if not page.get("ok", True):
+        lines.append(f"  Ошибка: [{page.get('error_type')}] {page.get('error')}")
+        return "\n".join(lines)
+
+    lines.append(f"  Заголовок: {page.get('title') or '—'}")
+    lines.append(
+        f"  Текст: {page.get('text_length', 0)} симв."
+        f" | ссылок: {page.get('links_count', 0)}"
+        f" | изображений: {page.get('images_count', 0)}"
+    )
+
+    headings: dict[str, list[str]] = page.get("headings") or {}
+    counts = ", ".join(f"{name}={len(items)}" for name, items in headings.items())
+    lines.append(
+        f"  Заголовки: {counts or '—'}"
+        f" | таблиц: {len(page.get('tables') or [])}"
+        f" | списков: {len(page.get('lists') or [])}"
+    )
+
+    metadata: dict[str, Any] = page.get("metadata") or {}
+    if description := metadata.get("description"):
+        lines.append(f"  Описание: {_shorten(description, 70)}")
+    if keywords := metadata.get("keywords"):
+        lines.append(f"  Ключевые слова: {', '.join(keywords)}")
+
+    links: list[str] = page.get("links") or []
+    for link in links[:max_links]:
+        lines.append(f"    - {link}")
+    if len(links) > max_links:
+        lines.append(f"    ... и ещё {len(links) - max_links}")
+
+    if page.get("truncated"):
+        lines.append("  Внимание: тело ответа было обрезано по лимиту размера")
+    for note in page.get("warnings") or []:
+        lines.append(f"  Предупреждение парсинга: {note}")
+
+    return "\n".join(lines)
+
+
+def format_parse_stats(pages: list[dict[str, Any]]) -> str:
+    """Агрегирует итоги по всем разобранным страницам."""
+    parsed = [page for page in pages if page.get("ok")]
+    if not parsed:
+        return "Парсинг: ни одна страница не разобрана"
+
+    links = sum(page.get("links_count", 0) for page in parsed)
+    images = sum(page.get("images_count", 0) for page in parsed)
+    text = sum(page.get("text_length", 0) for page in parsed)
+    return (
+        f"Парсинг: страниц {len(parsed)}/{len(pages)}, ссылок {links}, "
+        f"изображений {images}, текста {text} симв. "
+        f"(в среднем {text // len(parsed)} на страницу)"
+    )
+
+
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."

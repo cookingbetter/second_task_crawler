@@ -7,6 +7,7 @@ import logging
 import ssl
 import time
 from types import TracebackType
+from typing import Any
 
 import aiohttp
 import certifi
@@ -19,6 +20,7 @@ from src.models import (
     CrawlStats,
     FetchResult,
 )
+from src.parser import HTMLParser, empty_page
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,7 @@ class AsyncCrawler:
         max_body_bytes: int = 5_000_000,
         user_agent: str = "AsyncCrawler/1.0 (+https://example.com/bot)",
         ssl_context: ssl.SSLContext | None = None,
+        parser: HTMLParser | None = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent должен быть >= 1")
@@ -59,6 +62,7 @@ class AsyncCrawler:
         self.max_concurrent = max_concurrent
         self.max_body_bytes = max_body_bytes
         self.user_agent = user_agent
+        self.parser = parser or HTMLParser()
         self._ssl_context = ssl_context or _default_ssl_context()
         self._timeout = aiohttp.ClientTimeout(
             total=timeout_total,
@@ -137,6 +141,7 @@ class AsyncCrawler:
                         text=text,
                         elapsed=elapsed,
                         truncated=truncated,
+                        final_url=str(response.url),
                     )
             except asyncio.CancelledError:
                 raise
@@ -237,6 +242,17 @@ class AsyncCrawler:
             )
         return unique
 
+    def _unexpected(self, url: str, exc: BaseException) -> FetchResult:
+        """Оборачивает исключение, просочившееся из `gather`, в результат."""
+        logger.warning(
+            "Непредвиденное исключение для %s: %s", url, exc, exc_info=exc
+        )
+        return FetchResult(
+            url=url,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=ERROR_UNKNOWN,
+        )
+
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         """Загружает список URL параллельно; в словарь попадают только успешные."""
         urls = self._unique(urls)
@@ -252,16 +268,7 @@ class AsyncCrawler:
             if isinstance(item, FetchResult):
                 results.append(item)
             elif isinstance(item, BaseException):
-                logger.warning(
-                    "Непредвиденное исключение для %s: %s", url, item, exc_info=item
-                )
-                results.append(
-                    FetchResult(
-                        url=url,
-                        error=f"{type(item).__name__}: {item}",
-                        error_type=ERROR_UNKNOWN,
-                    )
-                )
+                results.append(self._unexpected(url, item))
 
         self.results = results
         self.stats = CrawlStats.from_results(results, elapsed)
@@ -289,6 +296,73 @@ class AsyncCrawler:
             elapsed,
         )
         return results
+
+    async def fetch_and_parse(self, url: str) -> dict[str, Any]:
+        """Загружает страницу и сразу разбирает её HTML.
+
+        Возвращает словарь одной и той же формы и при успехе, и при ошибке
+        загрузки: вызывающему коду не нужно разбираться с двумя типами ответа.
+        """
+        _result, page = await self._fetch_and_parse(url)
+        return page
+
+    async def _fetch_and_parse(self, url: str) -> tuple[FetchResult, dict[str, Any]]:
+        """Возвращает и `FetchResult` (для статистики), и разобранную страницу."""
+        result = await self.fetch_one(url)
+
+        if result.ok and result.text is not None:
+            # База для относительных ссылок — URL после редиректов.
+            page = await self.parser.parse_html(result.text, result.final_url or url)
+        else:
+            page = empty_page(url)
+
+        return result, self._merge_result(page, result)
+
+    @staticmethod
+    def _merge_result(page: dict[str, Any], result: FetchResult) -> dict[str, Any]:
+        """Дополняет разобранную страницу данными о самой загрузке."""
+        page.update(
+            url=result.url,
+            final_url=result.final_url,
+            status=result.status,
+            elapsed=result.elapsed,
+            truncated=result.truncated,
+            ok=result.ok,
+            error=result.error,
+            error_type=result.error_type,
+        )
+        return page
+
+    async def fetch_and_parse_many(self, urls: list[str]) -> list[dict[str, Any]]:
+        """Параллельно загружает и разбирает список URL, обновляя статистику."""
+        urls = self._unique(urls)
+        started = time.perf_counter()
+        raw = await asyncio.gather(
+            *(self._fetch_and_parse(url) for url in urls),
+            return_exceptions=True,
+        )
+        elapsed = time.perf_counter() - started
+
+        results: list[FetchResult] = []
+        pages: list[dict[str, Any]] = []
+        for url, item in zip(urls, raw, strict=True):
+            if isinstance(item, BaseException):
+                result = self._unexpected(url, item)
+                page = self._merge_result(empty_page(url), result)
+            else:
+                result, page = item
+            results.append(result)
+            pages.append(page)
+
+        self.results = results
+        self.stats = CrawlStats.from_results(results, elapsed)
+        logger.info(
+            "Загрузка с парсингом: %d/%d успешно за %.2f с",
+            self.stats.succeeded,
+            self.stats.total,
+            elapsed,
+        )
+        return pages
 
     async def close(self) -> None:
         """Закрывает сессию; повторный вызов безопасен."""
