@@ -40,6 +40,8 @@ second_task_crawler/
 │   ├── parser.py      # HTMLParser — парсинг HTML и извлечение данных
 │   ├── queue.py       # CrawlerQueue — очередь URL с приоритетами
 │   ├── semaphore.py   # SemaphoreManager — лимиты конкурентности
+│   ├── ratelimit.py   # RateLimiter — лимит скорости, задержки, backoff
+│   ├── robots.py      # RobotsParser — разбор и соблюдение robots.txt
 │   ├── filters.py     # UrlFilter — фильтрация URL для очереди
 │   ├── models.py      # FetchResult, CrawlStats
 │   ├── utils.py       # логирование, замер времени, вывод и сохранение
@@ -49,11 +51,15 @@ second_task_crawler/
 │   ├── test_main.py   # тесты HTTP-клиента
 │   ├── test_parser.py # тесты парсинга
 │   ├── test_queue.py  # тесты очереди, семафоров и фильтров
-│   └── test_crawl.py  # тесты обхода сайта
+│   ├── test_crawl.py  # тесты обхода сайта
+│   ├── test_ratelimit.py  # тесты лимита скорости и задержек
+│   ├── test_robots.py     # тесты разбора robots.txt
+│   └── test_politeness.py # тесты вежливости в обходе
 └── docs/
     ├── algorithm.md   # день 1: асинхронная загрузка
     ├── parsing.md     # день 2: парсинг HTML
-    └── queueing.md    # день 3: очередь, конкурентность, обход
+    ├── queueing.md    # день 3: очередь, конкурентность, обход
+    └── politeness.md  # день 4: rate limiting и robots.txt
 ```
 
 ## 🚀 Как запустить
@@ -95,6 +101,16 @@ python -m src.main --crawl --no-save --progress-interval 0  # без файла 
 
 Результаты обхода по умолчанию складываются в `data/crawl_<время>.json`
 (каталог `data/` не версионируется).
+
+Демонстрация вежливости (день 4):
+
+```bash
+python -m src.main --robots              # таблица решений robots.txt без обхода
+python -m src.main --robots --user-agent HTTrack   # агенту закрыт весь python.org
+python -m src.main --polite --max-pages 8 --same-domain  # обход с robots.txt и 2 зап/с
+python -m src.main --crawl --respect-robots --rps 1 --jitter 0.3
+python -m src.main --crawl --rotate-ua "BotA/1.0" "BotB/1.0" --rps 2
+```
 
 Тесты (работают оффлайн, поднимают локальный `aiohttp`-сервер):
 
@@ -215,9 +231,83 @@ asyncio.run(main())
 | `visited_urls: set` | URL, которые забрали из очереди и загрузили |
 | `processed_urls: dict` | URL -> разобранная страница |
 | `failed_urls: dict` | URL -> текст ошибки |
-| `skipped: Counter` | пропуски ссылок: `depth`, `filtered`, `duplicate`, `closed` |
+| `skipped: Counter` | пропуски ссылок: `depth`, `filtered`, `duplicate`, `closed`, `robots` |
+| `blocked_urls: dict` | URL -> правило robots.txt, из-за которого его не загрузили |
 | `queue`, `semaphores` | `CrawlerQueue` и `SemaphoreManager` со своими `get_stats()` |
+| `rate_limiter`, `robots` | `RateLimiter` и `RobotsParser` со своими `get_stats()` |
 
 Протокол завершения очереди (почему пустая очередь — ещё не конец обхода),
 порядок захвата семафоров и правила фильтров разобраны в
 [docs/queueing.md](docs/queueing.md).
+
+## 🧩 Вежливость: rate limiting и robots.txt (День 4)
+
+```python
+import asyncio
+from src.crawler import AsyncCrawler
+
+
+async def main():
+    async with AsyncCrawler(
+        max_concurrent=5,
+        requests_per_second=2.0,   # 2 запроса в секунду на домен
+        respect_robots=True,       # соблюдать robots.txt
+        min_delay=0.5,             # минимум 0.5 с между запросами
+        jitter=0.2,                # случайная добавка к паузе
+        user_agent="MyBot/1.0",
+    ) as crawler:
+        pages = await crawler.crawl(["https://quotes.toscrape.com/"], max_pages=20)
+        print(f"Обработано: {len(pages)}, запрещено robots.txt: {len(crawler.blocked_urls)}")
+        print(crawler.rate_limiter.get_stats())
+
+
+asyncio.run(main())
+```
+
+По умолчанию вежливость **выключена** (`requests_per_second=None`,
+`respect_robots=False`), поэтому простая загрузка списка URL из дней 1-2 не
+становится медленной неожиданно.
+
+| Параметр | Смысл |
+| --- | --- |
+| `requests_per_second` | лимит скорости; `None`/`0` — без собственного лимита |
+| `per_domain_rate` | лимит отдельный для каждого домена (по умолчанию) или общий |
+| `min_delay` | минимальная пауза между запросами к домену |
+| `jitter` | случайная добавка к паузе, только вверх |
+| `respect_robots` | проверять robots.txt перед каждым запросом |
+| `robots_allow_on_error` | считать сайт открытым, если robots.txt не загрузился |
+| `backoff_factor`, `max_backoff` | насколько и до какого предела замедляться после ошибок |
+| `user_agent`, `user_agents` | основной агент и список для ротации по кругу |
+
+Задержка между запросами — максимум из `1/requests_per_second`, `min_delay` и
+`Crawl-delay` из robots.txt, плюс штраф за ошибки и `jitter`. Отсчитывается она
+от времени последнего запроса, поэтому новое требование действует сразу: первая
+же страница сайта с `Crawl-delay: 30` ждёт полминуты. Лимитер стоит перед
+семафорами, поэтому ожидающая задача не держит слот конкурентности. Замедление
+включают только ошибки, похожие на перегрузку (таймаут, сеть, 5xx, 408, 429) —
+на 404 скорость не меняется. Повторов URL в дне 4 нет.
+
+Темп считается по домену (или общий на весь краулер при
+`per_domain_rate=False`), а `Crawl-delay` и штраф — всегда по сайту: при общем
+лимите домены делят одни часы, но не чужие задержки. robots.txt же кэшируется по
+серверу (схема, хост, порт): `host:8001` и `host:8002` — разные сервисы со
+своими правилами.
+
+Запрещённые robots.txt URL не считаются ошибками: они попадают в
+`blocked_urls` (URL -> сработавшее правило) и `skipped["robots"]`, не тратят
+бюджет `max_pages` и пишутся в лог вместе с правилом и агентом.
+
+| Класс / метод | Назначение |
+| --- | --- |
+| `RateLimiter.acquire(domain)` | дождаться разрешения на запрос |
+| `RateLimiter.penalize/reward(domain)` | замедлить домен после ошибки / ослабить штраф |
+| `RobotsParser.fetch_robots(base_url)` | загрузить robots.txt сервера (кэш на схему, хост и порт) |
+| `RobotsParser.can_fetch(url, user_agent)` | проверить URL по загруженным правилам |
+| `RobotsParser.get_crawl_delay(user_agent, url=...)` | задержка из robots.txt |
+
+Свой парсер robots.txt поддерживает группы `User-agent`, шаблоны `*` и `$`,
+приоритет самого длинного правила и `Crawl-delay`; `urllib.robotparser` из
+стандартной библиотеки сравнивает только префиксы и такие правила пропускает.
+Группа выбирается по имени краулера — тексту до первого `/`, — поэтому слова из
+ссылки в User-Agent не притягивают чужие запреты.
+Подробности — в [docs/politeness.md](docs/politeness.md).

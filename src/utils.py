@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.models import CrawlStats, FetchResult
+from src.ratelimit import GLOBAL_KEY as GLOBAL_RATE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,12 @@ def format_parse_stats(pages: list[dict[str, Any]]) -> str:
 
 
 def format_progress(stats: dict[str, Any]) -> str:
-    """Строка прогресса обхода: что сделано, что осталось, с какой скоростью."""
-    return (
+    """Строка прогресса обхода: что сделано, что осталось, с какой скоростью.
+
+    Про вежливость пишется только когда она включена: иначе строка для дней 1-3
+    обросла бы нулями, которые ничего не значат.
+    """
+    line = (
         f"Страниц: {stats.get('processed', 0)}"
         f" | в очереди: {stats.get('pending', 0)}"
         f" | в работе: {stats.get('in_progress', 0)}"
@@ -149,6 +154,14 @@ def format_progress(stats: dict[str, Any]) -> str:
         f" | {stats.get('pages_per_sec', 0.0):.1f} стр/с"
         f" | глубина: {stats.get('max_depth_reached', 0)}"
     )
+
+    rate: dict[str, Any] = stats.get("rate_limit") or {}
+    if rate.get("enabled"):
+        line += f" | ожидание: {rate.get('avg_wait', 0.0):.2f} с"
+    robots: dict[str, Any] = stats.get("robots") or {}
+    if robots.get("enabled"):
+        line += f" | robots: {robots.get('blocked', 0)}"
+    return line
 
 
 def print_progress(stats: dict[str, Any]) -> None:
@@ -199,6 +212,88 @@ def format_crawl_stats(stats: dict[str, Any], title: str = "Итог обход�
         )
     for host, peak in sorted(peak_by_host.items(), key=lambda item: -item[1])[:3]:
         lines.append(f"    {host}: пик {peak}")
+
+    rate: dict[str, Any] = stats.get("rate_limit") or {}
+    if rate.get("enabled") or rate.get("penalties"):
+        lines.append(format_rate_stats(rate))
+    robots: dict[str, Any] = stats.get("robots") or {}
+    if robots.get("enabled"):
+        lines.append(format_robots_stats(robots, blocked_urls=stats.get("blocked")))
+
+    return "\n".join(lines)
+
+
+def format_rate_stats(
+    stats: dict[str, Any], title: str = "  Ограничение скорости"
+) -> str:
+    """Что лимитер требовал и во что это обошлось по времени."""
+    limit = stats.get("requests_per_second")
+    scope = "на домен" if stats.get("per_domain") else "общий"
+    requests = stats.get("requests", 0)
+
+    lines = [
+        f"{title}: {f'{limit:.2f} зап/с' if limit else 'без лимита'} ({scope})"
+        f", min_delay {stats.get('min_delay', 0.0):.2f} с"
+        f", jitter {stats.get('jitter', 0.0):.2f} с",
+        f"    Запросов: {requests}"
+        f" | фактически {stats.get('actual_rps', 0.0):.2f} зап/с"
+        f" | средний интервал {stats.get('avg_gap', 0.0):.2f} с",
+        f"    Ожидание в лимитере: всего {stats.get('waited_total', 0.0):.2f} с"
+        f" | в среднем {stats.get('avg_wait', 0.0):.2f} с"
+        f" | максимум {stats.get('max_wait', 0.0):.2f} с",
+    ]
+
+    backoff: dict[str, float] = stats.get("backoff") or {}
+    if stats.get("penalties") or backoff:
+        penalty = ", ".join(
+            f"{domain} +{delay:.2f} с" for domain, delay in sorted(backoff.items())
+        )
+        lines.append(
+            f"    Замедление после ошибок: {stats.get('penalties', 0)} раз"
+            + (f" (сейчас: {penalty})" if penalty else "")
+        )
+
+    intervals: dict[str, float] = stats.get("interval_by_domain") or {}
+    for domain, interval in sorted(intervals.items(), key=lambda item: -item[1])[:3]:
+        if interval:
+            # Общий лимит живёт под служебным ключом, домена с таким именем нет.
+            name = "все домены" if domain == GLOBAL_RATE_KEY else domain
+            lines.append(f"      {name}: шаг {interval:.2f} с")
+
+    return "\n".join(lines)
+
+
+def format_robots_stats(
+    stats: dict[str, Any],
+    title: str = "  robots.txt",
+    *,
+    blocked_urls: int | None = None,
+) -> str:
+    """Сколько правил загружено и сколько URL из-за них не обошли."""
+    if not stats.get("enabled", True):
+        return f"{title}: не учитывается"
+
+    lines = [
+        f"{title}: проверок {stats.get('checks', 0)}"
+        f" | запрещено {stats.get('blocked', 0)}"
+        + (f" (уникальных URL {blocked_urls})" if blocked_urls is not None else "")
+        + f" | файлов загружено {stats.get('fetched', 0)}"
+        f" | нет файла {stats.get('missing', 0)}"
+        f" | ошибок {stats.get('errors', 0)}"
+    ]
+
+    delays: dict[str, float] = stats.get("crawl_delays") or {}
+    if delays:
+        parts = ", ".join(f"{domain} {delay:.2f} с" for domain, delay in sorted(delays.items()))
+        lines.append(f"    Crawl-delay: {parts}")
+
+    by_domain: dict[str, int] = stats.get("blocked_by_domain") or {}
+    if by_domain:
+        parts = ", ".join(
+            f"{domain} {count}"
+            for domain, count in sorted(by_domain.items(), key=lambda item: -item[1])[:3]
+        )
+        lines.append(f"    Запрещено по доменам: {parts}")
 
     return "\n".join(lines)
 

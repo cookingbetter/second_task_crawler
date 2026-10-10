@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import pytest
 from aiohttp import web
@@ -15,6 +15,11 @@ CHUNK = b"A" * 1000
 CHUNKED_SIZE = len(CHUNK) * 2
 NO_CHARSET_BODY = "<html>без charset в заголовке</html>"
 HITS_KEY = web.AppKey("hits", Counter)
+# Содержимое robots.txt подменяют тесты; None означает «файла нет» (404),
+# поэтому тесты дней 1-3 видят сервер точно таким, как раньше.
+ROBOTS_KEY = web.AppKey("robots", dict)
+# (путь, User-Agent) каждого запроса — для проверки ротации агентов.
+AGENTS_KEY = web.AppKey("agents", list)
 
 EXTERNAL_LINK = "https://external.example.org/outside"
 
@@ -142,6 +147,23 @@ async def handle_redirect(request: web.Request) -> web.Response:
     raise web.HTTPFound(REDIRECT_TARGET)
 
 
+async def handle_robots(request: web.Request) -> web.Response:
+    """Отдаёт robots.txt, который задал тест, или 404, если тест его не задавал."""
+    text = request.app[ROBOTS_KEY]["text"]
+    if text is None:
+        return web.Response(status=404, text="robots.txt не найден")
+    return web.Response(text=text, content_type="text/plain")
+
+
+@web.middleware
+async def record_agent(request: web.Request, handler: Callable) -> web.StreamResponse:
+    """Запоминает User-Agent каждого запроса: так видно ротацию агентов."""
+    request.app[AGENTS_KEY].append(
+        (request.path, request.headers.get("User-Agent", ""))
+    )
+    return await handler(request)
+
+
 async def handle_site(request: web.Request) -> web.Response:
     """Страница графа `SITE_LINKS`, считающая обращения к себе."""
     path = request.path
@@ -161,8 +183,11 @@ async def handle_site(request: web.Request) -> web.Response:
 @pytest.fixture
 async def server() -> AsyncIterator[TestServer]:
     """Поднимает aiohttp-приложение на случайном порту на время теста."""
-    app = web.Application()
+    app = web.Application(middlewares=[record_agent])
     app[HITS_KEY] = Counter()
+    app[ROBOTS_KEY] = {"text": None}
+    app[AGENTS_KEY] = []
+    app.router.add_get("/robots.txt", handle_robots)
     app.router.add_get("/ok", handle_ok)
     app.router.add_get("/slow", handle_slow)
     app.router.add_get("/status/{code}", handle_status)
@@ -198,3 +223,19 @@ def url(server: TestServer):
 def hits(server: TestServer) -> Counter:
     """Счётчик обращений к маршрутам, которые его ведут."""
     return server.app[HITS_KEY]
+
+
+@pytest.fixture
+def robots_txt(server: TestServer):
+    """Задаёт содержимое /robots.txt тестового сервера."""
+
+    def _set(text: str | None) -> None:
+        server.app[ROBOTS_KEY]["text"] = text
+
+    return _set
+
+
+@pytest.fixture
+def agents(server: TestServer) -> list[tuple[str, str]]:
+    """Пары (путь, User-Agent) по всем запросам к серверу."""
+    return server.app[AGENTS_KEY]

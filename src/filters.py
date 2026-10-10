@@ -35,6 +35,29 @@ def domain_key(url_or_host: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def origin_key(url: str) -> str:
+    """Схема, хост и порт — то, к чему привязан robots.txt.
+
+    В отличие от `domain_key`, порт и `www.` сохраняются: у сервера на другом
+    порту свой robots.txt, и путать их правила нельзя. Схема остаётся по той же
+    причине, хотя на практике файлы http и https почти всегда совпадают.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return domain_key(url)
+    if not parsed.scheme or not parsed.netloc:
+        return domain_key(url)
+
+    scheme = parsed.scheme.lower()
+    hostport = parsed.netloc.rsplit("@", 1)[-1]  # отбросить user:pass@
+    host, _, port = hostport.partition(":")
+    host = host.lower()
+    if port and port == DEFAULT_PORTS.get(scheme):
+        port = ""
+    return f"{scheme}://{host}" + (f":{port}" if port else "")
+
+
 def normalize_url(url: str) -> str:
     """Приводит URL к каноничному виду, чтобы одна страница не грузилась дважды.
 

@@ -84,7 +84,8 @@ async def get_next(self) -> str | None:
 загрузке.
 
 Повторов для неудачных URL в дне 3 нет: `mark_failed` закрывает URL
-окончательно. Политика повторов — тема дня 4.
+окончательно. Политика повторов — тема дня 5; день 4 добавляет только
+замедление домена после ошибок (см. [politeness.md](politeness.md)).
 
 ## Один адрес страницы: нормализация и редиректы
 
@@ -180,7 +181,7 @@ async def get_next(self) -> str | None:
 | `visited_urls: set[str]` | URL, которые забрали из очереди и загрузили |
 | `processed_urls: dict[str, dict]` | URL -> разобранная страница (успех) |
 | `failed_urls: dict[str, str]` | URL -> текст ошибки |
-| `skipped: Counter` | пропуски ссылок по причинам: `depth`, `filtered`, `duplicate`, `closed` |
+| `skipped: Counter` | пропуски ссылок по причинам: `depth`, `filtered`, `duplicate`, `closed`, `robots` |
 | `queue.seen: set[str]` | все URL, когда-либо добавленные в очередь (надмножество `visited_urls`) |
 
 `crawl()` сбрасывает это состояние на каждом запуске, поэтому один краулер можно

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import ssl
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from types import TracebackType
 from typing import Any
 
@@ -18,6 +19,7 @@ from src.filters import UrlFilter, normalize_url
 from src.models import (
     ERROR_HTTP,
     ERROR_NETWORK,
+    ERROR_ROBOTS,
     ERROR_TIMEOUT,
     ERROR_UNKNOWN,
     CrawlStats,
@@ -25,16 +27,24 @@ from src.models import (
 )
 from src.parser import HTMLParser, empty_page
 from src.queue import CrawlerQueue
+from src.ratelimit import RateLimiter
+from src.robots import RobotsParser, RobotsResponse
 from src.semaphore import SemaphoreManager
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 64 * 1024
+DEFAULT_USER_AGENT = "AsyncCrawler/1.0 (+https://example.com/bot)"
+# robots.txt больше этого размера — уже не правила обхода, а чья-то ошибка.
+ROBOTS_MAX_BYTES = 500_000
+# Коды, означающие «сайту сейчас тяжело»: на них задержка домена растёт.
+OVERLOAD_STATUSES = frozenset({408, 429})
 
 SKIP_DEPTH = "depth"
 SKIP_FILTERED = "filtered"
 SKIP_DUPLICATE = "duplicate"
 SKIP_CLOSED = "closed"
+SKIP_ROBOTS = "robots"
 
 
 def _default_ssl_context() -> ssl.SSLContext:
@@ -64,7 +74,18 @@ class AsyncCrawler:
         timeout_connect: float = 5.0,
         timeout_read: float = 10.0,
         max_body_bytes: int = 5_000_000,
-        user_agent: str = "AsyncCrawler/1.0 (+https://example.com/bot)",
+        user_agent: str = DEFAULT_USER_AGENT,
+        user_agents: Iterable[str] | None = None,
+        requests_per_second: float | None = None,
+        per_domain_rate: bool = True,
+        min_delay: float = 0.0,
+        jitter: float = 0.0,
+        backoff_factor: float = 2.0,
+        max_backoff: float = 60.0,
+        respect_robots: bool = False,
+        robots_allow_on_error: bool = True,
+        rate_limiter: RateLimiter | None = None,
+        robots: RobotsParser | None = None,
         ssl_context: ssl.SSLContext | None = None,
         parser: HTMLParser | None = None,
     ) -> None:
@@ -89,6 +110,38 @@ class AsyncCrawler:
         self._closed = False
         self.results: list[FetchResult] = []
         self.stats = CrawlStats()
+
+        # Вежливость (день 4). По умолчанию выключена: лимит скорости и
+        # robots.txt включаются явно, иначе простая загрузка списка URL
+        # неожиданно стала бы медленной.
+        if rate_limiter is not None and (requests_per_second or min_delay or jitter):
+            logger.warning(
+                "Передан готовый rate_limiter: настройки requests_per_second, "
+                "min_delay, jitter и backoff не применяются"
+            )
+        if robots is not None and not robots_allow_on_error:
+            logger.warning(
+                "Передан готовый RobotsParser: robots_allow_on_error не применяется"
+            )
+        self.rate_limiter = rate_limiter or RateLimiter(
+            requests_per_second,
+            per_domain_rate,
+            min_delay=min_delay,
+            jitter=jitter,
+            backoff_factor=backoff_factor,
+            max_backoff=max_backoff,
+        )
+        self.respect_robots = respect_robots
+        self.robots = robots or RobotsParser(
+            self._fetch_robots_txt,
+            user_agent=user_agent,
+            allow_on_error=robots_allow_on_error,
+        )
+        # Ротация агентов: пустой список означает «всегда основной агент».
+        self.user_agents = tuple(user_agents or ())
+        self._ua_cycle = itertools.cycle(self.user_agents) if self.user_agents else None
+        # URL -> правило robots.txt, из-за которого его не стали загружать.
+        self.blocked_urls: dict[str, str] = {}
 
         # Состояние обхода (день 3). `visited_urls` — URL, которые действительно
         # забрали из очереди и загрузили; за дедупликацию отвечает очередь,
@@ -144,16 +197,45 @@ class AsyncCrawler:
 
         return self._session
 
-    async def fetch_one(self, url: str) -> FetchResult:
-        """Загружает один URL и всегда возвращает результат, не поднимая исключений."""
+    async def fetch_one(
+        self,
+        url: str,
+        *,
+        user_agent: str | None = None,
+        robots_checked: bool = False,
+    ) -> FetchResult:
+        """Загружает один URL и всегда возвращает результат, не поднимая исключений.
+
+        Порядок проверок: robots.txt -> лимит скорости -> семафоры -> запрос.
+        Лимитер стоит перед семафорами намеренно: ожидающая задача не должна
+        держать слот конкурентности и мешать запросам к другим доменам.
+
+        `user_agent` переопределяет агента для этого запроса (иначе берётся
+        следующий по ротации), а `robots_checked` говорит, что вызывающий уже
+        спросил разрешения — чтобы одна страница не считалась в статистике
+        robots.txt дважды.
+        """
         session = self._get_session()
+        agent = user_agent or self._next_user_agent()
+
+        if self.respect_robots:
+            if not robots_checked:
+                allowed, rule = await self.robots.allows(url, agent)
+                if not allowed:
+                    return self._blocked(url, rule, agent)
+            # Правила домена уже в кэше, осталось учесть Crawl-delay из них.
+            self._apply_crawl_delay(url, agent)
+
+        waited = await self.rate_limiter.acquire(url)
 
         async with self.semaphores.acquire(url):
             # Время измеряется после семафора: ожидание в очереди — не время запроса.
             started = time.perf_counter()
             logger.info("Загрузка начата: %s", url)
             try:
-                async with session.get(url, raise_for_status=True) as response:
+                async with session.get(
+                    url, raise_for_status=True, headers={"User-Agent": agent}
+                ) as response:
                     body, truncated = await self._read_body(response, url)
                     text = self._decode_body(body, response, url)
                     elapsed = time.perf_counter() - started
@@ -164,6 +246,8 @@ class AsyncCrawler:
                         len(body),
                         elapsed,
                     )
+                    # Сайт отвечает — можно постепенно вернуться к обычному темпу.
+                    self.rate_limiter.reward(url)
                     return FetchResult(
                         url=url,
                         status=response.status,
@@ -171,11 +255,20 @@ class AsyncCrawler:
                         elapsed=elapsed,
                         truncated=truncated,
                         final_url=str(response.url),
+                        waited=waited,
+                        user_agent=agent,
                     )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                return self._failure(url, started, ERROR_TIMEOUT, "превышен таймаут")
+                return self._failure(
+                    url,
+                    started,
+                    ERROR_TIMEOUT,
+                    "превышен таймаут",
+                    waited=waited,
+                    user_agent=agent,
+                )
             except aiohttp.ClientResponseError as exc:
                 return self._failure(
                     url,
@@ -183,15 +276,83 @@ class AsyncCrawler:
                     ERROR_HTTP,
                     f"HTTP {exc.status}: {exc.message}",
                     status=exc.status,
+                    waited=waited,
+                    user_agent=agent,
                 )
             except aiohttp.ClientError as exc:
                 return self._failure(
-                    url, started, ERROR_NETWORK, f"{type(exc).__name__}: {exc}"
+                    url,
+                    started,
+                    ERROR_NETWORK,
+                    f"{type(exc).__name__}: {exc}",
+                    waited=waited,
+                    user_agent=agent,
                 )
             except Exception as exc:  # защита от падения всего запуска
                 return self._failure(
-                    url, started, ERROR_UNKNOWN, f"{type(exc).__name__}: {exc}"
+                    url,
+                    started,
+                    ERROR_UNKNOWN,
+                    f"{type(exc).__name__}: {exc}",
+                    waited=waited,
+                    user_agent=agent,
                 )
+
+    def _next_user_agent(self) -> str:
+        """Следующий агент по кругу или основной, если ротация не настроена."""
+        return self.user_agent if self._ua_cycle is None else next(self._ua_cycle)
+
+    def _apply_crawl_delay(self, url: str, user_agent: str) -> None:
+        """Переносит `Crawl-delay` из robots.txt в лимитер скорости."""
+        delay = self.robots.get_crawl_delay(user_agent, url=url)
+        if delay:
+            self.rate_limiter.set_crawl_delay(url, delay)
+
+    def _blocked(self, url: str, rule: str | None, user_agent: str) -> FetchResult:
+        """Результат для URL, запрещённого robots.txt: запроса в сеть не было."""
+        reason = "robots.txt запрещает загрузку"
+        if rule:
+            reason = f"{reason} ({rule})"
+        return FetchResult(
+            url=url, error=reason, error_type=ERROR_ROBOTS, user_agent=user_agent
+        )
+
+    async def _fetch_robots_txt(self, robots_url: str) -> RobotsResponse:
+        """Загружает robots.txt для `RobotsParser`.
+
+        Запрос идёт мимо проверки robots.txt (иначе получилась бы рекурсия), но
+        через лимит скорости и семафоры: сам robots.txt — тоже запрос к сайту.
+        """
+        session = self._get_session()
+        await self.rate_limiter.acquire(robots_url)
+
+        async with self.semaphores.acquire(robots_url):
+            try:
+                async with session.get(
+                    robots_url, headers={"User-Agent": self.user_agent}
+                ) as response:
+                    if response.status >= 400:
+                        return RobotsResponse(status=response.status)
+
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size >= ROBOTS_MAX_BYTES:
+                            logger.warning("robots.txt обрезан: %s", robots_url)
+                            break
+                    body = b"".join(chunks)[:ROBOTS_MAX_BYTES]
+                    return RobotsResponse(
+                        status=response.status,
+                        text=self._decode_body(body, response, robots_url),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                return RobotsResponse(error="превышен таймаут")
+            except aiohttp.ClientError as exc:
+                return RobotsResponse(error=f"{type(exc).__name__}: {exc}")
 
     async def _read_body(
         self, response: aiohttp.ClientResponse, url: str
@@ -244,16 +405,34 @@ class AsyncCrawler:
         message: str,
         *,
         status: int | None = None,
+        waited: float = 0.0,
+        user_agent: str | None = None,
     ) -> FetchResult:
         elapsed = time.perf_counter() - started
         logger.warning("Ошибка загрузки %s [%s]: %s", url, error_type, message)
+        if self._overloaded(error_type, status):
+            self.rate_limiter.penalize(url)
         return FetchResult(
             url=url,
             status=status,
             elapsed=elapsed,
             error=message,
             error_type=error_type,
+            waited=waited,
+            user_agent=user_agent,
         )
+
+    @staticmethod
+    def _overloaded(error_type: str, status: int | None) -> bool:
+        """Похожа ли ошибка на перегрузку сайта, а не на нашу собственную.
+
+        Замедляться стоит от таймаутов, сетевых сбоев, 5xx и явных «слишком
+        много запросов». Обычный 404 к скорости отношения не имеет: из-за битых
+        ссылок обход тормозил бы без причины.
+        """
+        if error_type in (ERROR_TIMEOUT, ERROR_NETWORK, ERROR_UNKNOWN):
+            return True
+        return status is not None and (status >= 500 or status in OVERLOAD_STATUSES)
 
     async def fetch_url(self, url: str) -> str:
         """Загружает страницу и возвращает её текст, поднимая исключение при ошибке."""
@@ -335,9 +514,17 @@ class AsyncCrawler:
         _result, page = await self._fetch_and_parse(url)
         return page
 
-    async def _fetch_and_parse(self, url: str) -> tuple[FetchResult, dict[str, Any]]:
+    async def _fetch_and_parse(
+        self,
+        url: str,
+        *,
+        user_agent: str | None = None,
+        robots_checked: bool = False,
+    ) -> tuple[FetchResult, dict[str, Any]]:
         """Возвращает и `FetchResult` (для статистики), и разобранную страницу."""
-        result = await self.fetch_one(url)
+        result = await self.fetch_one(
+            url, user_agent=user_agent, robots_checked=robots_checked
+        )
 
         if result.ok and result.text is not None:
             # База для относительных ссылок — URL после редиректов.
@@ -359,6 +546,8 @@ class AsyncCrawler:
             ok=result.ok,
             error=result.error,
             error_type=result.error_type,
+            waited=result.waited,
+            user_agent=result.user_agent,
         )
         return page
 
@@ -436,13 +625,17 @@ class AsyncCrawler:
         self.visited_urls = set()
         self.failed_urls = {}
         self.processed_urls = {}
+        self.blocked_urls = {}
         self.skipped = Counter()
         self._final_urls = set()
         self.results = []
         self._pages_started = 0
-        # Семафоры переиспользуются между обходами, но их пики — нет: иначе
-        # второй обход показывал бы статистику первого.
+        # Семафоры, лимитер и парсер robots.txt переиспользуются между обходами,
+        # но их счётчики — нет: иначе второй обход показывал бы статистику
+        # первого. Разобранные правила и шаг задержек при этом сохраняются.
         self.semaphores.reset_stats()
+        self.rate_limiter.reset_stats()
+        self.robots.reset_stats()
         pages: list[dict[str, Any]] = []
 
         for url in seeds:
@@ -451,11 +644,13 @@ class AsyncCrawler:
 
         logger.info(
             "Обход начат: %d стартовых URL, max_pages=%d, max_depth=%d, "
-            "воркеров %d",
+            "воркеров %d, лимит %s зап/с, robots.txt %s",
             len(self.queue.seen),
             max_pages,
             depth_limit,
             self.max_concurrent,
+            self.rate_limiter.requests_per_second or "без лимита",
+            "учитывается" if self.respect_robots else "игнорируется",
         )
 
         started = time.perf_counter()
@@ -512,31 +707,54 @@ class AsyncCrawler:
                 logger.debug("Воркер %d: работы больше нет", number)
                 return
 
-            if url in self._final_urls:
-                # Эту страницу уже загружали под другим адресом: о редиректе
-                # становится известно только после загрузки, и ссылка на цель
-                # могла попасть в очередь раньше.
-                logger.debug("URL ведёт на уже загруженную страницу: %s", url)
-                self.skipped[SKIP_DUPLICATE] += 1
-                queue.mark_skipped(url)
-                continue
-
-            # Проверка и инкремент без await между ними, поэтому лимит страниц
-            # соблюдается точно, без перебора на число воркеров.
-            if self._pages_started >= max_pages:
-                logger.info(
-                    "Достигнут лимит %d страниц, обход останавливается", max_pages
-                )
-                queue.mark_skipped(url)
-                queue.close()
-                return
-            self._pages_started += 1
-
-            depth = queue.depth_of(url)
+            # Весь путь после get_next идёт под try/finally: на любом выходе
+            # взятый URL нужно отпустить, иначе in_progress останется
+            # завышенным и остальные воркеры будут ждать работу, которой нет.
             marked = False
             try:
+                if url in self._final_urls:
+                    # Эту страницу уже загружали под другим адресом: о редиректе
+                    # становится известно только после загрузки, и ссылка на цель
+                    # могла попасть в очередь раньше.
+                    logger.debug("URL ведёт на уже загруженную страницу: %s", url)
+                    self.skipped[SKIP_DUPLICATE] += 1
+                    continue
+
+                if self._pages_started >= max_pages:
+                    # Бюджет исчерпан — спрашивать robots.txt не о чем: иначе
+                    # URL, который никто не собирался грузить, попал бы в
+                    # статистику проверок и, возможно, в blocked_urls.
+                    logger.info(
+                        "Достигнут лимит %d страниц, обход останавливается", max_pages
+                    )
+                    queue.close()
+                    return
+
+                user_agent = self._next_user_agent()
+                if self.respect_robots:
+                    # Проверка до расхода бюджета: запрещённый URL не должен
+                    # тратить лимит страниц и попадать в неудачные загрузки.
+                    allowed, rule = await self.robots.allows(url, user_agent)
+                    if not allowed:
+                        self.skipped[SKIP_ROBOTS] += 1
+                        self.blocked_urls[url] = rule or "robots.txt"
+                        continue
+
+                    if self._pages_started >= max_pages:
+                        # Пока спрашивали разрешение, бюджет могли израсходовать
+                        # другие воркеры.
+                        queue.close()
+                        return
+
+                # Проверка и инкремент без await между ними, поэтому лимит
+                # страниц соблюдается точно, без перебора на число воркеров.
+                self._pages_started += 1
+
+                depth = queue.depth_of(url)
                 try:
-                    result, page = await self._fetch_and_parse(url)
+                    result, page = await self._fetch_and_parse(
+                        url, user_agent=user_agent, robots_checked=self.respect_robots
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # падение воркера не должно рвать обход
@@ -563,8 +781,6 @@ class AsyncCrawler:
                 marked = True
             finally:
                 if not marked:
-                    # Иначе in_progress остался бы завышенным, и остальные
-                    # воркеры ждали бы работу, которой больше не будет.
                     queue.mark_skipped(url)
 
     def _remember_redirect(self, url: str, result: FetchResult) -> None:
@@ -665,7 +881,7 @@ class AsyncCrawler:
             logger.warning("Callback прогресса упал: %s: %s", type(exc).__name__, exc)
 
     def get_crawl_stats(self) -> dict[str, Any]:
-        """Сводная статистика обхода: очередь, семафоры и причины пропусков."""
+        """Сводная статистика обхода: очередь, семафоры, вежливость, пропуски."""
         stats = self.queue.get_stats()
         stats.update(
             visited=len(self.visited_urls),
@@ -673,6 +889,9 @@ class AsyncCrawler:
             skipped=dict(self.skipped),
             skipped_total=sum(self.skipped.values()),
             semaphores=self.semaphores.get_stats(),
+            rate_limit=self.rate_limiter.get_stats(),
+            robots={**self.robots.get_stats(), "enabled": self.respect_robots},
+            blocked=len(self.blocked_urls),
         )
         return stats
 

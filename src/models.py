@@ -7,6 +7,7 @@ from dataclasses import dataclass
 ERROR_TIMEOUT = "timeout"
 ERROR_HTTP = "http"
 ERROR_NETWORK = "network"
+ERROR_ROBOTS = "robots"
 ERROR_UNKNOWN = "unknown"
 
 
@@ -23,6 +24,10 @@ class FetchResult:
     truncated: bool = False
     # URL после редиректов: именно он служит базой для относительных ссылок.
     final_url: str | None = None
+    # Сколько запрос прождал разрешения у лимитера скорости.
+    waited: float = 0.0
+    # Агент, под которым ушёл запрос: при ротации он у страниц разный.
+    user_agent: str | None = None
 
     @property
     def ok(self) -> bool:
