@@ -9,6 +9,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,14 @@ def format_stats(stats: CrawlStats, title: str = "Статистика") -> str:
 
 
 def format_results_table(results: list[FetchResult]) -> str:
-    """Собирает таблицу по результатам: статус, время, размер тела или ошибка."""
-    header = f"{'URL':<45} {'Статус':<8} {'Время':>8}  Детали"
+    """Собирает таблицу по результатам: статус, время, размер тела или ошибка.
+
+    Колонка попыток появляется только если повторы были: без них таблица дней
+    1-3 осталась бы с лишним столбцом единиц.
+    """
+    retried = any(result.attempts > 1 for result in results)
+    attempts_header = f" {'Попыток':>8}" if retried else ""
+    header = f"{'URL':<45} {'Статус':<8} {'Время':>8}{attempts_header}  Детали"
     lines = [header, "-" * len(header)]
 
     for result in results:
@@ -76,7 +83,10 @@ def format_results_table(results: list[FetchResult]) -> str:
         else:
             status = str(result.status) if result.status else "-"
             details = f"[{result.error_type}] {result.error}"
-        lines.append(f"{url:<45} {status:<8} {result.elapsed:>7.2f}s  {details}")
+        attempts = f" {result.attempts:>8}" if retried else ""
+        lines.append(
+            f"{url:<45} {status:<8} {result.elapsed:>7.2f}s{attempts}  {details}"
+        )
 
     return "\n".join(lines)
 
@@ -161,6 +171,12 @@ def format_progress(stats: dict[str, Any]) -> str:
     robots: dict[str, Any] = stats.get("robots") or {}
     if robots.get("enabled"):
         line += f" | robots: {robots.get('blocked', 0)}"
+    retry: dict[str, Any] = stats.get("retry") or {}
+    if retry.get("retries"):
+        line += f" | повторов: {retry['retries']}"
+    circuit: dict[str, Any] = stats.get("circuit") or {}
+    if circuit.get("open"):
+        line += f" | отключено доменов: {len(circuit['open'])}"
     return line
 
 
@@ -219,6 +235,13 @@ def format_crawl_stats(stats: dict[str, Any], title: str = "Итог обход�
     robots: dict[str, Any] = stats.get("robots") or {}
     if robots.get("enabled"):
         lines.append(format_robots_stats(robots, blocked_urls=stats.get("blocked")))
+
+    retry: dict[str, Any] = stats.get("retry") or {}
+    if retry.get("retries") or retry.get("errors_total"):
+        lines.append(format_retry_stats(retry))
+    circuit: dict[str, Any] = stats.get("circuit") or {}
+    if circuit.get("enabled"):
+        lines.append(format_circuit_stats(circuit))
 
     return "\n".join(lines)
 
@@ -298,6 +321,124 @@ def format_robots_stats(
     return "\n".join(lines)
 
 
+def format_retry_stats(stats: dict[str, Any], title: str = "  Повторы") -> str:
+    """Настройки повторов и то, что они дали: сколько URL спасено и какой ценой."""
+    if not stats.get("enabled"):
+        return f"{title}: выключены"
+
+    lines = [
+        f"{title}: до {stats.get('max_retries', 0)} на запрос"
+        f", backoff x{stats.get('backoff_factor', 0.0):.2f}"
+        f" от {stats.get('base_delay', 0.0):.2f} с"
+        f" (потолок {stats.get('max_delay', 0.0):.2f} с)",
+        f"    Запросов: {stats.get('calls', 0)}"
+        f" | попыток {stats.get('attempts', 0)}"
+        f" | повторов {stats.get('retries', 0)}"
+        f" | спасено повтором {stats.get('retry_success', 0)}"
+        f" | исчерпано {stats.get('exhausted', 0)}"
+        f" | без повтора {stats.get('not_retried', 0)}",
+    ]
+
+    if stats.get("retries"):
+        lines.append(
+            f"    Ожидание повторов: всего {stats.get('wait_total', 0.0):.2f} с"
+            f" | в среднем {stats.get('avg_wait', 0.0):.2f} с"
+            f" | максимум {stats.get('max_wait', 0.0):.2f} с"
+        )
+    if classes := stats.get("by_class"):
+        lines.append(f"    Классы ошибок: {_format_counts(classes)}")
+
+    return "\n".join(lines)
+
+
+def format_circuit_stats(
+    stats: dict[str, Any], title: str = "  Circuit breaker"
+) -> str:
+    """Порог отключения домена и то, сколько раз он сработал."""
+    if not stats.get("enabled"):
+        return f"{title}: выключен"
+
+    lines = [
+        f"{title}: порог {stats.get('failure_threshold', 0)} ошибок"
+        f" за {stats.get('window', 0.0):.0f} с"
+        f", восстановление через {stats.get('recovery_time', 0.0):.0f} с",
+        f"    Домены: {stats.get('domains', 0)}"
+        f" | отключений {stats.get('trips', 0)}"
+        f" | отказов без запроса {stats.get('refused', 0)}"
+        f" | восстановлений {stats.get('recoveries', 0)}",
+    ]
+    if opened := stats.get("open"):
+        lines.append(f"    Отключены сейчас: {', '.join(opened)}")
+    if probing := stats.get("half_open"):
+        lines.append(f"    Проверяются пробным запросом: {', '.join(probing)}")
+
+    return "\n".join(lines)
+
+
+def format_error_report(
+    report: dict[str, Any],
+    title: str = "Ошибки",
+    *,
+    max_urls: int = 5,
+) -> str:
+    """Сводка по ошибкам: типы, классы, польза повторов и постоянные URL."""
+    failed = report.get("failed", 0)
+    lines = [
+        f"{title}: результатов {report.get('total', 0)}"
+        f", неудачных {failed}"
+        f", постоянных {report.get('permanent_count', 0)}"
+    ]
+    if not failed and not report.get("retried_urls"):
+        return lines[0] + " — ошибок не было"
+
+    if by_type := report.get("by_type"):
+        lines.append(f"  По типам: {_format_counts(by_type)}")
+    if by_class := report.get("by_class"):
+        lines.append(f"  По классам: {_format_counts(by_class)}")
+    if report.get("retried_urls"):
+        lines.append(
+            f"  Повторы: URL с повторами {report['retried_urls']}"
+            f" | спасено {report.get('retry_success', 0)}"
+            f" | ожидание {report.get('retry_waited', 0.0):.2f} с"
+            f" (в среднем {report.get('avg_retry_wait', 0.0):.2f} с на повтор)"
+        )
+
+    permanent: list[dict[str, Any]] = report.get("permanent_urls") or []
+    if permanent:
+        lines.append(f"  Постоянные ошибки ({report.get('permanent_count', 0)}):")
+        for item in permanent[:max_urls]:
+            lines.append(f"    {item.get('url')} -> {item.get('error')}")
+        if len(permanent) > max_urls:
+            lines.append(f"    ... и ещё {len(permanent) - max_urls}")
+
+    return "\n".join(lines)
+
+
+def _format_counts(counts: dict[str, Any]) -> str:
+    """Счётчики по убыванию: самое частое — первым."""
+    return ", ".join(
+        f"{name}={count}"
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    )
+
+
+def save_error_report(report: dict[str, Any], path: str | Path) -> Path:
+    """Сохраняет отчёт об ошибках в JSON: его удобно приложить к разбору сбоя."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        **report,
+    }
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+    logger.info(
+        "Отчёт об ошибках сохранён: %s (неудачных %s)", target, report.get("failed")
+    )
+    return target
+
+
 def save_crawl_results(
     pages: list[dict[str, Any]],
     stats: dict[str, Any],
@@ -306,7 +447,7 @@ def save_crawl_results(
     """Сохраняет страницы и статистику обхода в один JSON-файл.
 
     Намеренно простой синхронный `json.dump`: полноценный слой сохранения
-    (потоковая запись, форматы, база данных) — тема дня 5.
+    (потоковая запись, форматы, база данных) — тема отдельного дня.
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

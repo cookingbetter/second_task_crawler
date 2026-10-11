@@ -9,6 +9,9 @@ from src.models import ERROR_HTTP, ERROR_NETWORK, ERROR_TIMEOUT
 from tests.conftest import CHUNKED_SIZE, NO_CHARSET_BODY, OK_BODY
 
 UNREACHABLE_URL = "http://this-domain-does-not-exist-12345.invalid/"
+# День 5 включает повторы по умолчанию. Тестам дня 1 важен сам факт ошибки, а
+# не её повторная загрузка, поэтому они просят одну попытку.
+NO_RETRIES = {"max_retries": 0}
 
 
 async def test_fetch_url_returns_body(url):
@@ -30,7 +33,7 @@ async def test_fetch_one_success_fields(url):
 
 @pytest.mark.parametrize("code", [404, 500])
 async def test_http_errors_are_captured(url, code):
-    async with AsyncCrawler() as crawler:
+    async with AsyncCrawler(**NO_RETRIES) as crawler:
         result = await crawler.fetch_one(url(f"/status/{code}"))
 
     assert not result.ok
@@ -47,7 +50,7 @@ async def test_fetch_url_raises_on_http_error(url):
 
 
 async def test_unreachable_host_is_network_error():
-    async with AsyncCrawler() as crawler:
+    async with AsyncCrawler(**NO_RETRIES) as crawler:
         result = await crawler.fetch_one(UNREACHABLE_URL)
 
     assert not result.ok
@@ -55,7 +58,9 @@ async def test_unreachable_host_is_network_error():
 
 
 async def test_read_timeout(url):
-    async with AsyncCrawler(timeout_total=5.0, timeout_read=0.2) as crawler:
+    async with AsyncCrawler(
+        timeout_total=5.0, timeout_read=0.2, **NO_RETRIES
+    ) as crawler:
         result = await crawler.fetch_one(url("/slow?delay=1.0"))
 
     assert not result.ok
@@ -70,7 +75,7 @@ async def test_fetch_urls_keeps_only_successful(url):
         UNREACHABLE_URL,
     ]
 
-    async with AsyncCrawler(max_concurrent=4) as crawler:
+    async with AsyncCrawler(max_concurrent=4, **NO_RETRIES) as crawler:
         pages = await crawler.fetch_urls(urls)
         stats = crawler.stats
         results = crawler.results

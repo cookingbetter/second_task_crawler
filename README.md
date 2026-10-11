@@ -42,6 +42,9 @@ second_task_crawler/
 │   ├── semaphore.py   # SemaphoreManager — лимиты конкурентности
 │   ├── ratelimit.py   # RateLimiter — лимит скорости, задержки, backoff
 │   ├── robots.py      # RobotsParser — разбор и соблюдение robots.txt
+│   ├── errors.py      # классификация ошибок: временные, постоянные, сетевые
+│   ├── retry.py       # RetryStrategy — повторы с экспоненциальным backoff
+│   ├── circuit.py     # CircuitBreaker — отключение упавшего домена
 │   ├── filters.py     # UrlFilter — фильтрация URL для очереди
 │   ├── models.py      # FetchResult, CrawlStats
 │   ├── utils.py       # логирование, замер времени, вывод и сохранение
@@ -54,12 +57,17 @@ second_task_crawler/
 │   ├── test_crawl.py  # тесты обхода сайта
 │   ├── test_ratelimit.py  # тесты лимита скорости и задержек
 │   ├── test_robots.py     # тесты разбора robots.txt
-│   └── test_politeness.py # тесты вежливости в обходе
+│   ├── test_politeness.py # тесты вежливости в обходе
+│   ├── test_errors.py     # тесты классификации ошибок
+│   ├── test_retry.py      # тесты стратегии повторов
+│   ├── test_circuit.py    # тесты circuit breaker
+│   └── test_retry_crawler.py  # тесты повторов в краулере
 └── docs/
     ├── algorithm.md   # день 1: асинхронная загрузка
     ├── parsing.md     # день 2: парсинг HTML
     ├── queueing.md    # день 3: очередь, конкурентность, обход
-    └── politeness.md  # день 4: rate limiting и robots.txt
+    ├── politeness.md  # день 4: rate limiting и robots.txt
+    └── errors.md      # день 5: ошибки, повторы, circuit breaker
 ```
 
 ## 🚀 Как запустить
@@ -111,6 +119,17 @@ python -m src.main --polite --max-pages 8 --same-domain  # обход с robots.
 python -m src.main --crawl --respect-robots --rps 1 --jitter 0.3
 python -m src.main --crawl --rotate-ua "BotA/1.0" "BotB/1.0" --rps 2
 ```
+
+Демонстрация повторов и обработки ошибок (день 5):
+
+```bash
+python -m src.main --retry                 # адреса с 503, 429, 404, таймаутом и мёртвым DNS
+python -m src.main --retry --no-retry      # то же без повторов, для сравнения
+python -m src.main --retry --max-retries 4 --retry-base-delay 1
+python -m src.main --crawl --max-pages 6 --circuit-breaker --circuit-threshold 3
+```
+
+Отчёт об ошибках режима `--retry` складывается в `data/errors_<время>.json`.
 
 Тесты (работают оффлайн, поднимают локальный `aiohttp`-сервер):
 
@@ -285,7 +304,8 @@ asyncio.run(main())
 же страница сайта с `Crawl-delay: 30` ждёт полминуты. Лимитер стоит перед
 семафорами, поэтому ожидающая задача не держит слот конкурентности. Замедление
 включают только ошибки, похожие на перегрузку (таймаут, сеть, 5xx, 408, 429) —
-на 404 скорость не меняется. Повторов URL в дне 4 нет.
+на 404 скорость не меняется. Штраф ставится один раз на URL, по итогу всех
+попыток: паузы между попытками — дело повторов из дня 5.
 
 Темп считается по домену (или общий на весь краулер при
 `per_domain_rate=False`), а `Crawl-delay` и штраф — всегда по сайту: при общем
@@ -311,3 +331,76 @@ asyncio.run(main())
 Группа выбирается по имени краулера — тексту до первого `/`, — поэтому слова из
 ссылки в User-Agent не притягивают чужие запреты.
 Подробности — в [docs/politeness.md](docs/politeness.md).
+
+## 🧩 Ошибки и повторы (День 5)
+
+```python
+import asyncio
+from src.crawler import AsyncCrawler
+from src.errors import NetworkError, TransientError
+from src.retry import RetryStrategy
+
+
+async def main():
+    retry_strategy = RetryStrategy(
+        max_retries=3,
+        backoff_factor=2.0,
+        retry_on=[TransientError, NetworkError],
+    )
+    async with AsyncCrawler(retry_strategy=retry_strategy) as crawler:
+        # Таймаут и 503 будут повторены, 404 — нет.
+        result = await crawler.fetch_one("https://httpbin.org/status/503")
+        print(result.error_class, result.attempts)
+        print(crawler.get_error_report())
+
+
+asyncio.run(main())
+```
+
+Повторы **включены по умолчанию** и умеренно: `max_retries=2`, базовая пауза
+0.5 с, экспоненциальный рост. Временная ошибка не должна стоить страницы, но и
+долбить сайт краулер не станет. Circuit breaker по умолчанию **выключен**.
+
+| Ответ или исключение | Класс ошибки | Повтор |
+| --- | --- | --- |
+| 429 | `RateLimitError` | да, с увеличенной паузой и учётом `Retry-After` |
+| 500, 502, 503, 504 | `ServerError` | да, на один раз меньше обычного |
+| 408, 425 | `TransientError` | да |
+| таймаут | `CrawlerTimeoutError` | да, таймаут следующей попытки больше |
+| DNS, connection refused | `NetworkError` | да |
+| 401, 403, 404, 410 | `PermanentError` | нет |
+| отказ разбора страницы | `ParseError` | нет |
+| отказ circuit breaker'а | `CircuitOpenError` | нет |
+| запрет robots.txt | `RobotsBlockedError` | нет |
+
+| Параметр | Смысл |
+| --- | --- |
+| `max_retries` | максимум повторов запроса (0 — без повторов) |
+| `retry_base_delay`, `retry_backoff_factor` | базовая пауза и во сколько раз она растёт |
+| `retry_max_delay`, `retry_jitter` | предел паузы и случайная добавка |
+| `timeout_growth`, `timeout_max_total` | насколько растут таймауты с попытками и их потолок |
+| `circuit_breaker` | отключать домен, который отдаёт одни ошибки |
+| `circuit_threshold`, `circuit_window`, `circuit_recovery` | порог неудачных запросов, окно и время до пробного запроса |
+| `retry_strategy`, `breaker` | готовые `RetryStrategy` и `CircuitBreaker` вместо скаляров |
+
+Готовый объект настраивает себя сам, поэтому переданные рядом с ним скаляры
+краулер не применяет и предупреждает о каждом из них в логе.
+
+`FetchResult` и страницы обхода получили `attempts`, `error_class` и
+`retry_waited`, а `get_crawl_stats()` — разделы `retry`, `circuit` и `errors`.
+Отчёт `get_error_report()` содержит распределение ошибок по типам и классам,
+число спасённых повторами URL и список постоянных ошибок.
+
+| Класс / метод | Назначение |
+| --- | --- |
+| `RetryStrategy.execute_with_retry(coro, *args)` | выполнить с повторами по классу ошибки |
+| `RetryStrategy.policy_for(error)` / `delay_for(error, attempt)` | политика и пауза для ошибки |
+| `RetryStrategy.get_stats()` / `reset_stats()` | статистика повторов |
+| `CircuitBreaker.allow(url)` | можно ли сейчас идти к домену |
+| `CircuitBreaker.record_success/record_failure(url, error)` | сообщить об исходе запроса |
+| `AsyncCrawler.timeout_for_attempt(attempt)` | таймауты конкретной попытки |
+| `AsyncCrawler.get_error_report()` | сводка по ошибкам последнего запуска |
+| `errors.from_exception(exc)` / `from_http_status(status)` | классификация ошибки |
+
+Подробности, формулы backoff и осознанные ограничения —
+в [docs/errors.md](docs/errors.md).

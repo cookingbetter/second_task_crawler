@@ -272,7 +272,9 @@ async def test_rate_limit_is_off_by_default(url):
 
 
 async def test_server_error_slows_down_the_domain(url):
-    async with AsyncCrawler(max_backoff=1.0) as crawler:
+    # Повторы дня 5 здесь не при чём: проверяется штраф лимитеру, и одна
+    # попытка делает тест и быстрее, и точнее.
+    async with AsyncCrawler(max_backoff=1.0, max_retries=0) as crawler:
         result = await crawler.fetch_one(url("/status/503"))
 
     assert result.ok is False
@@ -289,7 +291,7 @@ async def test_not_found_does_not_slow_down_the_domain(url):
 
 
 async def test_successful_request_reduces_the_penalty(url):
-    async with AsyncCrawler(max_backoff=1.0) as crawler:
+    async with AsyncCrawler(max_backoff=1.0, max_retries=0) as crawler:
         await crawler.fetch_one(url("/status/503"))
         penalty = crawler.rate_limiter.backoff_for(url("/"))
 

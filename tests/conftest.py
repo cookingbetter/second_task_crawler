@@ -20,6 +20,12 @@ HITS_KEY = web.AppKey("hits", Counter)
 ROBOTS_KEY = web.AppKey("robots", dict)
 # (путь, User-Agent) каждого запроса — для проверки ротации агентов.
 AGENTS_KEY = web.AppKey("agents", list)
+# Сколько раз просили каждый «нестабильный» адрес: по нему видно повторы.
+FLAKY_KEY = web.AppKey("flaky", Counter)
+
+FLAKY_BODY = "<html><body><h1>Наконец-то</h1></body></html>"
+# Код, которым тест просит «не отвечать вовремя» вместо ошибки статусом.
+FLAKY_TIMEOUT = 0
 
 EXTERNAL_LINK = "https://external.example.org/outside"
 
@@ -155,6 +161,33 @@ async def handle_robots(request: web.Request) -> web.Response:
     return web.Response(text=text, content_type="text/plain")
 
 
+async def handle_flaky(request: web.Request) -> web.Response:
+    """Падает первые `fail` обращений, а потом отдаёт страницу.
+
+    Параметры запроса: `key` — отдельный счётчик для каждого теста, `fail` —
+    сколько первых попыток провалить, `status` — каким кодом (0 означает «не
+    ответить вовремя»), `retry_after` — значение одноимённого заголовка,
+    `delay` — сколько спать в режиме таймаута.
+    """
+    key = request.query.get("key", "default")
+    fail_times = int(request.query.get("fail", "1"))
+    status = int(request.query.get("status", "503"))
+
+    attempt = request.app[FLAKY_KEY][key] = request.app[FLAKY_KEY][key] + 1
+    if attempt > fail_times:
+        return web.Response(text=FLAKY_BODY, content_type="text/html")
+
+    if status == FLAKY_TIMEOUT:
+        # Клиент не дождётся ответа и получит таймаут.
+        await asyncio.sleep(float(request.query.get("delay", "1.0")))
+        return web.Response(text="слишком поздно", content_type="text/html")
+
+    headers = {}
+    if (retry_after := request.query.get("retry_after")) is not None:
+        headers["Retry-After"] = retry_after
+    return web.Response(status=status, text=f"flaky {status}", headers=headers)
+
+
 @web.middleware
 async def record_agent(request: web.Request, handler: Callable) -> web.StreamResponse:
     """Запоминает User-Agent каждого запроса: так видно ротацию агентов."""
@@ -187,7 +220,9 @@ async def server() -> AsyncIterator[TestServer]:
     app[HITS_KEY] = Counter()
     app[ROBOTS_KEY] = {"text": None}
     app[AGENTS_KEY] = []
+    app[FLAKY_KEY] = Counter()
     app.router.add_get("/robots.txt", handle_robots)
+    app.router.add_get("/flaky", handle_flaky)
     app.router.add_get("/ok", handle_ok)
     app.router.add_get("/slow", handle_slow)
     app.router.add_get("/status/{code}", handle_status)
@@ -239,3 +274,9 @@ def robots_txt(server: TestServer):
 def agents(server: TestServer) -> list[tuple[str, str]]:
     """Пары (путь, User-Agent) по всем запросам к серверу."""
     return server.app[AGENTS_KEY]
+
+
+@pytest.fixture
+def flaky_hits(server: TestServer) -> Counter:
+    """Сколько попыток пришлось на каждый «нестабильный» адрес."""
+    return server.app[FLAKY_KEY]

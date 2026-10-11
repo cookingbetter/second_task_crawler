@@ -8,6 +8,9 @@ ERROR_TIMEOUT = "timeout"
 ERROR_HTTP = "http"
 ERROR_NETWORK = "network"
 ERROR_ROBOTS = "robots"
+ERROR_PARSE = "parse"
+# Домен отключён circuit breaker'ом: запроса в сеть не было.
+ERROR_CIRCUIT = "circuit"
 ERROR_UNKNOWN = "unknown"
 
 
@@ -28,6 +31,12 @@ class FetchResult:
     waited: float = 0.0
     # Агент, под которым ушёл запрос: при ротации он у страниц разный.
     user_agent: str | None = None
+    # Сколько попыток ушло на этот результат: 1 — повторов не было.
+    attempts: int = 1
+    # Класс ошибки из src/errors.py: по нему видно, временная она или нет.
+    error_class: str | None = None
+    # Суммарная пауза между попытками (без времени самих запросов).
+    retry_waited: float = 0.0
 
     @property
     def ok(self) -> bool:

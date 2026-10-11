@@ -15,12 +15,20 @@ from typing import Any
 import aiohttp
 import certifi
 
+from src.circuit import CircuitBreaker
+from src.errors import (
+    CircuitOpenError,
+    CrawlerError,
+    NetworkError,
+    ParseError,
+    PermanentError,
+    RobotsBlockedError,
+    TransientError,
+    from_exception,
+)
 from src.filters import UrlFilter, normalize_url
 from src.models import (
-    ERROR_HTTP,
-    ERROR_NETWORK,
     ERROR_ROBOTS,
-    ERROR_TIMEOUT,
     ERROR_UNKNOWN,
     CrawlStats,
     FetchResult,
@@ -28,6 +36,7 @@ from src.models import (
 from src.parser import HTMLParser, empty_page
 from src.queue import CrawlerQueue
 from src.ratelimit import RateLimiter
+from src.retry import RetryOutcome, RetryStrategy
 from src.robots import RobotsParser, RobotsResponse
 from src.semaphore import SemaphoreManager
 
@@ -37,14 +46,36 @@ CHUNK_SIZE = 64 * 1024
 DEFAULT_USER_AGENT = "AsyncCrawler/1.0 (+https://example.com/bot)"
 # robots.txt больше этого размера — уже не правила обхода, а чья-то ошибка.
 ROBOTS_MAX_BYTES = 500_000
-# Коды, означающие «сайту сейчас тяжело»: на них задержка домена растёт.
-OVERLOAD_STATUSES = frozenset({408, 429})
+# Классы ошибок, которые повтор не исправит: такие URL попадают в отчёт
+# постоянными.
+PERMANENT_CLASSES = frozenset({PermanentError.__name__, ParseError.__name__})
 
 SKIP_DEPTH = "depth"
 SKIP_FILTERED = "filtered"
 SKIP_DUPLICATE = "duplicate"
 SKIP_CLOSED = "closed"
 SKIP_ROBOTS = "robots"
+
+
+def _fallback(value: Any, default: Any) -> Any:
+    """Значение аргумента или значение по умолчанию, если его не передавали.
+
+    `None` здесь означает именно «не передавали»: иначе нельзя отличить
+    `max_retries=2`, написанное руками, от значения по умолчанию, и
+    предупреждение о проигнорированных настройках врало бы.
+    """
+    return default if value is None else value
+
+
+def _warn_ignored(what: str, **args: Any) -> None:
+    """Сообщает, что скалярные настройки не применились к готовому объекту."""
+    ignored = sorted(name for name, value in args.items() if value is not None)
+    if ignored:
+        logger.warning(
+            "Передан готовый %s: настройки %s не применяются",
+            what,
+            ", ".join(ignored),
+        )
 
 
 def _default_ssl_context() -> ssl.SSLContext:
@@ -84,6 +115,22 @@ class AsyncCrawler:
         max_backoff: float = 60.0,
         respect_robots: bool = False,
         robots_allow_on_error: bool = True,
+        # Значения по умолчанию подставляются ниже: None означает «не
+        # передавали», и только так видно, какие настройки игнорирует готовая
+        # RetryStrategy или CircuitBreaker.
+        max_retries: int | None = None,
+        retry_base_delay: float | None = None,
+        retry_backoff_factor: float | None = None,
+        retry_max_delay: float | None = None,
+        retry_jitter: float | None = None,
+        timeout_growth: float = 1.5,
+        timeout_max_total: float = 60.0,
+        circuit_breaker: bool = False,
+        circuit_threshold: int | None = None,
+        circuit_window: float | None = None,
+        circuit_recovery: float | None = None,
+        retry_strategy: RetryStrategy | None = None,
+        breaker: CircuitBreaker | None = None,
         rate_limiter: RateLimiter | None = None,
         robots: RobotsParser | None = None,
         ssl_context: ssl.SSLContext | None = None,
@@ -93,6 +140,8 @@ class AsyncCrawler:
             raise ValueError("max_concurrent должен быть >= 1")
         if max_depth < 0:
             raise ValueError("max_depth должен быть >= 0")
+        if timeout_growth < 1:
+            raise ValueError("timeout_growth должен быть >= 1")
 
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -100,6 +149,11 @@ class AsyncCrawler:
         self.user_agent = user_agent
         self.parser = parser or HTMLParser()
         self._ssl_context = ssl_context or _default_ssl_context()
+        self.timeout_total = timeout_total
+        self.timeout_connect = timeout_connect
+        self.timeout_read = timeout_read
+        self.timeout_growth = timeout_growth
+        self.timeout_max_total = timeout_max_total
         self._timeout = aiohttp.ClientTimeout(
             total=timeout_total,
             connect=timeout_connect,
@@ -137,6 +191,43 @@ class AsyncCrawler:
             user_agent=user_agent,
             allow_on_error=robots_allow_on_error,
         )
+
+        # Повторы (день 5). Включены по умолчанию и умеренно: временная ошибка
+        # не должна стоить страницы, но и долбить сайт краулер не станет.
+        if retry_strategy is not None:
+            _warn_ignored(
+                "RetryStrategy",
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+                retry_backoff_factor=retry_backoff_factor,
+                retry_max_delay=retry_max_delay,
+                retry_jitter=retry_jitter,
+            )
+        self.retry_strategy = retry_strategy or RetryStrategy(
+            _fallback(max_retries, 2),
+            _fallback(retry_backoff_factor, 2.0),
+            base_delay=_fallback(retry_base_delay, 0.5),
+            max_delay=_fallback(retry_max_delay, 30.0),
+            jitter=_fallback(retry_jitter, 0.0),
+        )
+        # Circuit breaker по умолчанию выключен: он отказывает в загрузке без
+        # обращения в сеть, и такое решение краулер не должен принимать молча.
+        # Готовый объект включает его сам — передавать его «на всякий случай»
+        # никто не будет.
+        if breaker is not None:
+            _warn_ignored(
+                "CircuitBreaker",
+                circuit_threshold=circuit_threshold,
+                circuit_window=circuit_window,
+                circuit_recovery=circuit_recovery,
+            )
+        self.circuit: CircuitBreaker | None = breaker
+        if self.circuit is None and circuit_breaker:
+            self.circuit = CircuitBreaker(
+                _fallback(circuit_threshold, 5),
+                _fallback(circuit_window, 60.0),
+                _fallback(circuit_recovery, 30.0),
+            )
         # Ротация агентов: пустой список означает «всегда основной агент».
         self.user_agents = tuple(user_agents or ())
         self._ua_cycle = itertools.cycle(self.user_agents) if self.user_agents else None
@@ -206,16 +297,20 @@ class AsyncCrawler:
     ) -> FetchResult:
         """Загружает один URL и всегда возвращает результат, не поднимая исключений.
 
-        Порядок проверок: robots.txt -> лимит скорости -> семафоры -> запрос.
-        Лимитер стоит перед семафорами намеренно: ожидающая задача не должна
-        держать слот конкурентности и мешать запросам к другим доменам.
+        Порядок проверок: robots.txt -> повторы -> circuit breaker -> лимит
+        скорости -> семафоры -> запрос. Лимитер стоит перед семафорами
+        намеренно: ожидающая задача не должна держать слот конкурентности и
+        мешать запросам к другим доменам.
+
+        robots.txt спрашивается один раз, вне цикла повторов: его решение от
+        попытки к попытке не меняется.
 
         `user_agent` переопределяет агента для этого запроса (иначе берётся
         следующий по ротации), а `robots_checked` говорит, что вызывающий уже
         спросил разрешения — чтобы одна страница не считалась в статистике
         robots.txt дважды.
         """
-        session = self._get_session()
+        self._get_session()  # «краулер закрыт» видно до первой попытки
         agent = user_agent or self._next_user_agent()
 
         if self.respect_robots:
@@ -226,15 +321,55 @@ class AsyncCrawler:
             # Правила домена уже в кэше, осталось учесть Crawl-delay из них.
             self._apply_crawl_delay(url, agent)
 
+        outcome = RetryOutcome()
+        try:
+            result = await self.retry_strategy.execute_with_retry(
+                self._fetch_attempt,
+                url,
+                agent,
+                label=url,
+                attempt_kwarg="attempt",
+                outcome=outcome,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return self._failure(url, from_exception(exc), agent, outcome)
+
+        result.attempts = outcome.attempts
+        result.retry_waited = outcome.waited
+        return result
+
+    async def _fetch_attempt(
+        self, url: str, agent: str, *, attempt: int = 1
+    ) -> FetchResult:
+        """Одна попытка загрузки: результат или типизированная ошибка.
+
+        В отличие от `fetch_one`, поднимает исключения из
+        [errors.py](errors.py): решение о повторе принимает `RetryStrategy`, и
+        ей нужен класс ошибки, а не поле в результате.
+        """
+        session = self._get_session()
+        if self.circuit is not None and not self.circuit.allow(url):
+            # Домен отключён: сеть не трогаем вовсе, повторять тоже нечего.
+            raise CircuitOpenError(
+                "домен отключён circuit breaker'ом "
+                f"(состояние {self.circuit.state_of(url)})"
+            )
+
         waited = await self.rate_limiter.acquire(url)
+        timeout = self.timeout_for_attempt(attempt)
 
         async with self.semaphores.acquire(url):
             # Время измеряется после семафора: ожидание в очереди — не время запроса.
             started = time.perf_counter()
-            logger.info("Загрузка начата: %s", url)
+            logger.info("Загрузка начата: %s (попытка %d)", url, attempt)
             try:
                 async with session.get(
-                    url, raise_for_status=True, headers={"User-Agent": agent}
+                    url,
+                    raise_for_status=True,
+                    headers={"User-Agent": agent},
+                    timeout=timeout,
                 ) as response:
                     body, truncated = await self._read_body(response, url)
                     text = self._decode_body(body, response, url)
@@ -248,6 +383,8 @@ class AsyncCrawler:
                     )
                     # Сайт отвечает — можно постепенно вернуться к обычному темпу.
                     self.rate_limiter.reward(url)
+                    if self.circuit is not None:
+                        self.circuit.record_success(url)
                     return FetchResult(
                         url=url,
                         status=response.status,
@@ -257,46 +394,53 @@ class AsyncCrawler:
                         final_url=str(response.url),
                         waited=waited,
                         user_agent=agent,
+                        attempts=attempt,
                     )
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError:
-                return self._failure(
-                    url,
-                    started,
-                    ERROR_TIMEOUT,
-                    "превышен таймаут",
-                    waited=waited,
-                    user_agent=agent,
-                )
-            except aiohttp.ClientResponseError as exc:
-                return self._failure(
-                    url,
-                    started,
-                    ERROR_HTTP,
-                    f"HTTP {exc.status}: {exc.message}",
-                    status=exc.status,
-                    waited=waited,
-                    user_agent=agent,
-                )
-            except aiohttp.ClientError as exc:
-                return self._failure(
-                    url,
-                    started,
-                    ERROR_NETWORK,
-                    f"{type(exc).__name__}: {exc}",
-                    waited=waited,
-                    user_agent=agent,
-                )
             except Exception as exc:  # защита от падения всего запуска
-                return self._failure(
+                error = from_exception(exc)
+                error.attempts = attempt
+                error.elapsed = time.perf_counter() - started
+                error.waited = waited
+                logger.warning(
+                    "Попытка %d не удалась: %s [%s] %s (%.2f с)",
+                    attempt,
                     url,
-                    started,
-                    ERROR_UNKNOWN,
-                    f"{type(exc).__name__}: {exc}",
-                    waited=waited,
-                    user_agent=agent,
+                    error.error_type,
+                    error,
+                    error.elapsed,
                 )
+                if self.circuit is not None:
+                    self.circuit.record_failure(url, error)
+                if error is exc:
+                    raise
+                raise error from exc
+
+    def timeout_for_attempt(self, attempt: int = 1) -> aiohttp.ClientTimeout:
+        """Таймауты попытки: с каждым повтором они растут.
+
+        Медленный сервер чаще перегружен, чем мёртв, и повтор с тем же
+        таймаутом упал бы по той же причине. Потолок `timeout_max_total`
+        не даёт одному URL висеть минутами, но и урезать исходный таймаут не
+        может: иначе у краулера с `timeout_total` больше потолка повтор получал
+        бы меньше времени, чем первая попытка.
+        """
+        if attempt <= 1 or self.timeout_growth <= 1.0:
+            return self._timeout
+
+        growth = self.timeout_growth ** (attempt - 1)
+
+        def scale(value: float | None) -> float | None:
+            if not value:
+                return value
+            return max(value, min(value * growth, self.timeout_max_total))
+
+        return aiohttp.ClientTimeout(
+            total=scale(self.timeout_total),
+            connect=scale(self.timeout_connect),
+            sock_read=scale(self.timeout_read),
+        )
 
     def _next_user_agent(self) -> str:
         """Следующий агент по кругу или основной, если ротация не настроена."""
@@ -314,7 +458,13 @@ class AsyncCrawler:
         if rule:
             reason = f"{reason} ({rule})"
         return FetchResult(
-            url=url, error=reason, error_type=ERROR_ROBOTS, user_agent=user_agent
+            url=url,
+            error=reason,
+            error_type=ERROR_ROBOTS,
+            # Класс нужен, чтобы сознательный отказ не попал в отчёт
+            # «неизвестной ошибкой» рядом с настоящими сбоями.
+            error_class=RobotsBlockedError.__name__,
+            user_agent=user_agent,
         )
 
     async def _fetch_robots_txt(self, robots_url: str) -> RobotsResponse:
@@ -400,39 +550,51 @@ class AsyncCrawler:
     def _failure(
         self,
         url: str,
-        started: float,
-        error_type: str,
-        message: str,
-        *,
-        status: int | None = None,
-        waited: float = 0.0,
-        user_agent: str | None = None,
+        error: CrawlerError,
+        user_agent: str | None,
+        outcome: RetryOutcome,
     ) -> FetchResult:
-        elapsed = time.perf_counter() - started
-        logger.warning("Ошибка загрузки %s [%s]: %s", url, error_type, message)
-        if self._overloaded(error_type, status):
+        """Итоговый результат URL, который загрузить не удалось.
+
+        Штраф лимитеру ставится здесь, один раз на URL, а не на каждой попытке:
+        паузы между попытками — дело `RetryStrategy`, и двойное наказание
+        разогнало бы задержку домена в геометрической прогрессии.
+        """
+        logger.warning(
+            "Загрузка не удалась: %s [%s] %s (попыток %d, ожидание повторов %.2f с)",
+            url,
+            error.error_class,
+            error,
+            outcome.attempts,
+            outcome.waited,
+        )
+        if self._overloaded(error):
             self.rate_limiter.penalize(url)
         return FetchResult(
             url=url,
-            status=status,
-            elapsed=elapsed,
-            error=message,
-            error_type=error_type,
-            waited=waited,
+            status=error.status,
+            elapsed=error.elapsed,
+            error=error.message,
+            error_type=error.error_type,
+            error_class=error.error_class,
+            waited=error.waited,
             user_agent=user_agent,
+            attempts=outcome.attempts or error.attempts,
+            retry_waited=outcome.waited,
         )
 
     @staticmethod
-    def _overloaded(error_type: str, status: int | None) -> bool:
+    def _overloaded(error: CrawlerError) -> bool:
         """Похожа ли ошибка на перегрузку сайта, а не на нашу собственную.
 
         Замедляться стоит от таймаутов, сетевых сбоев, 5xx и явных «слишком
-        много запросов». Обычный 404 к скорости отношения не имеет: из-за битых
-        ссылок обход тормозил бы без причины.
+        много запросов» — всё это временные ошибки. Обычный 404 к скорости
+        отношения не имеет: из-за битых ссылок обход тормозил бы без причины, а
+        отказ circuit breaker'а и вовсе не был запросом.
         """
-        if error_type in (ERROR_TIMEOUT, ERROR_NETWORK, ERROR_UNKNOWN):
+        if isinstance(error, (TransientError, NetworkError)):
             return True
-        return status is not None and (status >= 500 or status in OVERLOAD_STATUSES)
+        return error.error_type == ERROR_UNKNOWN
 
     async def fetch_url(self, url: str) -> str:
         """Загружает страницу и возвращает её текст, поднимая исключение при ошибке."""
@@ -455,10 +617,14 @@ class AsyncCrawler:
         logger.warning(
             "Непредвиденное исключение для %s: %s", url, exc, exc_info=exc
         )
+        error = from_exception(exc)
         return FetchResult(
             url=url,
-            error=f"{type(exc).__name__}: {exc}",
-            error_type=ERROR_UNKNOWN,
+            status=error.status,
+            error=error.message,
+            error_type=error.error_type,
+            error_class=error.error_class,
+            attempts=error.attempts,
         )
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
@@ -526,13 +692,32 @@ class AsyncCrawler:
             url, user_agent=user_agent, robots_checked=robots_checked
         )
 
+        page = empty_page(url)
         if result.ok and result.text is not None:
-            # База для относительных ссылок — URL после редиректов.
-            page = await self.parser.parse_html(result.text, result.final_url or url)
-        else:
-            page = empty_page(url)
+            try:
+                # База для относительных ссылок — URL после редиректов.
+                page = await self.parser.parse_html(
+                    result.text, result.final_url or url
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Парсер сам кривую разметку переживает и отдаёт частичный
+                # результат; сюда попадает только отказ самого разбора. Повтор
+                # не поможет: второй раз придёт тот же HTML.
+                self._parse_failed(result, ParseError(f"{type(exc).__name__}: {exc}"))
+                page = empty_page(url)
 
         return result, self._merge_result(page, result)
+
+    @staticmethod
+    def _parse_failed(result: FetchResult, error: ParseError) -> None:
+        """Переводит загруженный результат в ошибку разбора, сохранив статус."""
+        logger.warning("Не удалось разобрать страницу %s: %s", result.url, error)
+        result.text = None
+        result.error = error.message
+        result.error_type = error.error_type
+        result.error_class = error.error_class
 
     @staticmethod
     def _merge_result(page: dict[str, Any], result: FetchResult) -> dict[str, Any]:
@@ -546,8 +731,11 @@ class AsyncCrawler:
             ok=result.ok,
             error=result.error,
             error_type=result.error_type,
+            error_class=result.error_class,
             waited=result.waited,
             user_agent=result.user_agent,
+            attempts=result.attempts,
+            retry_waited=result.retry_waited,
         )
         return page
 
@@ -636,6 +824,9 @@ class AsyncCrawler:
         self.semaphores.reset_stats()
         self.rate_limiter.reset_stats()
         self.robots.reset_stats()
+        self.retry_strategy.reset_stats()
+        if self.circuit is not None:
+            self.circuit.reset_stats()
         pages: list[dict[str, Any]] = []
 
         for url in seeds:
@@ -881,7 +1072,7 @@ class AsyncCrawler:
             logger.warning("Callback прогресса упал: %s: %s", type(exc).__name__, exc)
 
     def get_crawl_stats(self) -> dict[str, Any]:
-        """Сводная статистика обхода: очередь, семафоры, вежливость, пропуски."""
+        """Сводная статистика обхода: очередь, семафоры, вежливость, ошибки."""
         stats = self.queue.get_stats()
         stats.update(
             visited=len(self.visited_urls),
@@ -892,8 +1083,64 @@ class AsyncCrawler:
             rate_limit=self.rate_limiter.get_stats(),
             robots={**self.robots.get_stats(), "enabled": self.respect_robots},
             blocked=len(self.blocked_urls),
+            retry=self.retry_strategy.get_stats(),
+            circuit=(
+                self.circuit.get_stats()
+                if self.circuit is not None
+                else {"enabled": False}
+            ),
+            errors=self.get_error_report(),
         )
         return stats
+
+    def get_error_report(self, *, max_urls: int = 50) -> dict[str, Any]:
+        """Отчёт об ошибках последнего запуска: типы, повторы, постоянные URL.
+
+        Считается из `self.results`, без отдельного состояния: результаты и так
+        хранят всё нужное — класс ошибки, число попыток и ожидание повторов.
+        """
+        by_type: Counter[str] = Counter()
+        by_class: Counter[str] = Counter()
+        permanent: list[dict[str, Any]] = []
+        retried = 0
+        retry_waited = 0.0
+        failed = 0
+
+        for result in self.results:
+            if result.attempts > 1:
+                retried += 1
+                retry_waited += result.retry_waited
+            if result.ok:
+                continue
+            failed += 1
+            by_type[result.error_type or ERROR_UNKNOWN] += 1
+            by_class[result.error_class or ERROR_UNKNOWN] += 1
+            if result.error_class in PERMANENT_CLASSES:
+                permanent.append(
+                    {
+                        "url": result.url,
+                        "status": result.status,
+                        "error": result.error,
+                        "error_class": result.error_class,
+                        "attempts": result.attempts,
+                    }
+                )
+
+        retry_stats = self.retry_strategy.get_stats()
+        return {
+            "total": len(self.results),
+            "failed": failed,
+            "by_type": dict(by_type),
+            "by_class": dict(by_class),
+            # URL, которым потребовался хотя бы один повтор, и сколько времени
+            # эти паузы заняли.
+            "retried_urls": retried,
+            "retry_waited": retry_waited,
+            "retry_success": retry_stats["retry_success"],
+            "avg_retry_wait": retry_stats["avg_wait"],
+            "permanent_count": len(permanent),
+            "permanent_urls": permanent[:max_urls],
+        }
 
     async def close(self) -> None:
         """Закрывает сессию; повторный вызов безопасен."""
