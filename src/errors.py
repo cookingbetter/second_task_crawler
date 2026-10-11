@@ -22,6 +22,7 @@ from src.models import (
     ERROR_NETWORK,
     ERROR_PARSE,
     ERROR_ROBOTS,
+    ERROR_STORAGE,
     ERROR_TIMEOUT,
     ERROR_UNKNOWN,
 )
@@ -128,6 +129,44 @@ class RobotsBlockedError(CrawlerError):
     """
 
     error_type = ERROR_ROBOTS
+
+
+class StorageError(TransientError):
+    """Сохранить страницу не удалось, но попытка имеет смысл.
+
+    Переполненный диск освобождают, заблокированную базу отпускают, временный
+    сбой файловой системы проходит — поэтому запись повторяется так же, как
+    запрос к серверу, через `RetryStrategy`.
+    """
+
+    error_type = ERROR_STORAGE
+
+
+class StorageDataError(PermanentError):
+    """Сама запись не годится для сохранения: повтор ничего не изменит.
+
+    Например, в данных оказался объект, который не переводится в JSON. Второй
+    раз он переведётся ровно так же.
+    """
+
+    error_type = ERROR_STORAGE
+
+
+def storage_error(exc: BaseException, *, target: str = "") -> CrawlerError:
+    """Классифицирует сбой записи: повторять его или бессмысленно.
+
+    `OSError` (и `sqlite3.OperationalError`, который до нас доходит как
+    `OperationalError`) — про внешние обстоятельства, а `TypeError` и
+    `ValueError` — про сами данные.
+    """
+    if isinstance(exc, CrawlerError):
+        return exc
+
+    where = f" ({target})" if target else ""
+    detail = f"{type(exc).__name__}: {exc}{where}"
+    if isinstance(exc, (TypeError, ValueError)):
+        return StorageDataError(detail)
+    return StorageError(detail)
 
 
 def from_http_status(

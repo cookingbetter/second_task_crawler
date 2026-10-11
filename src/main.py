@@ -1,5 +1,6 @@
 """Демо AsyncCrawler: загрузка (день 1), парсинг (день 2), обход (день 3),
-соблюдение правил вежливости (день 4) и повторы при ошибках (день 5)."""
+соблюдение правил вежливости (день 4), повторы при ошибках (день 5) и
+сохранение данных в файлы и базу (день 6)."""
 
 from __future__ import annotations
 
@@ -13,6 +14,13 @@ from typing import Any
 from src.crawler import DEFAULT_USER_AGENT, AsyncCrawler
 from src.models import CrawlStats
 from src.parser import HTMLParser
+from src.storage import (
+    CSVStorage,
+    DataStorage,
+    JSONStorage,
+    MultiStorage,
+    SQLiteStorage,
+)
 from src.utils import (
     format_circuit_stats,
     format_crawl_stats,
@@ -22,7 +30,9 @@ from src.utils import (
     format_results_table,
     format_retry_stats,
     format_robots_stats,
+    format_saved_sample,
     format_stats,
+    format_storage_stats,
     print_progress,
     save_crawl_results,
     save_error_report,
@@ -100,10 +110,22 @@ RETRY_PRESET = {"timeout_total": 4.0, "timeout_read": 3.0, "retry_max_delay": 6.
 # Значения по умолчанию для флагов, которые пресеты могут переопределить.
 DEFAULT_RETRY_SETTINGS = {"retry_max_delay": 30.0}
 
+# Форматы сохранения (день 6) и расширения их файлов.
+STORAGE_SUFFIXES = {
+    "json": ".json",
+    "jsonl": ".jsonl",
+    "csv": ".csv",
+    "sqlite": ".db",
+}
+# Режим --store показывает три формата из задания; jsonl включают отдельно.
+STORE_PRESET_FORMATS = ("json", "csv", "sqlite")
+# Батчи по умолчанию: файлу незачем копить страницы, а базе — есть зачем.
+DEFAULT_BATCH_SIZES = {"json": 1, "jsonl": 1, "csv": 1, "sqlite": 50}
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Демо асинхронного краулера (дни 1-5)"
+        description="Демо асинхронного краулера (дни 1-6)"
     )
     parser.add_argument(
         "--urls",
@@ -176,7 +198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help="не сохранять результаты обхода в файл",
+        help="не сохранять единый файл результатов обхода (на --storage не влияет)",
     )
     parser.add_argument(
         "--progress-interval",
@@ -318,6 +340,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="через сколько секунд пробовать отключённый домен снова (по умолчанию 30)",
     )
     parser.add_argument(
+        "--store",
+        action="store_true",
+        help=(
+            "режим дня 6: обход с сохранением сразу в "
+            f"{', '.join(STORE_PRESET_FORMATS)} и чтением данных обратно"
+        ),
+    )
+    parser.add_argument(
+        "--storage",
+        nargs="+",
+        choices=sorted(STORAGE_SUFFIXES),
+        metavar="FORMAT",
+        help=(
+            "куда сохранять страницы в режимах --crawl и --parse: "
+            f"{', '.join(sorted(STORAGE_SUFFIXES))}"
+        ),
+    )
+    parser.add_argument(
+        "--storage-path",
+        help="путь к файлам хранилищ без расширения (по умолчанию data/pages_<время>)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help=(
+            "сколько записей накапливать перед записью "
+            f"(по умолчанию {DEFAULT_BATCH_SIZES['json']} для файлов"
+            f" и {DEFAULT_BATCH_SIZES['sqlite']} для SQLite)"
+        ),
+    )
+    parser.add_argument(
+        "--save-failed",
+        action="store_true",
+        help="сохранять в хранилище и неудачные страницы (по умолчанию нет)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -340,6 +398,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"{name} должен быть >= {minimum}, получено {value}")
     if args.progress_interval < 0:
         parser.error("--progress-interval не может быть отрицательным")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error(f"--batch-size должен быть >= 1, получено {args.batch_size}")
     if args.retry_backoff < 1:
         parser.error(f"--retry-backoff должен быть >= 1, получено {args.retry_backoff}")
     if args.timeout_growth < 1:
@@ -355,6 +415,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         for name, value in POLITE_PRESET.items():
             if getattr(args, name) is None:
                 setattr(args, name, value)
+
+    if args.store:
+        # Режим сам по себе означает обход с сохранением: отдельно включать
+        # --crawl и перечислять форматы не нужно.
+        args.crawl = True
+        if not args.storage:
+            args.storage = list(STORE_PRESET_FORMATS)
 
     if args.retry:
         # Короткие таймауты нужны самому режиму, но явный флаг сильнее пресета.
@@ -406,6 +473,62 @@ def _crawler_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "circuit_threshold": args.circuit_threshold,
         "circuit_recovery": args.circuit_recovery,
     }
+
+
+def build_storage(args: argparse.Namespace) -> DataStorage | None:
+    """Собирает хранилище по флагам: одно на формат, несколько — через MultiStorage."""
+    if not args.storage:
+        return None
+    if args.no_save:
+        # Хранилища запрашивают явно, и отменять такую просьбу общим флагом
+        # неправильно: --no-save про единый дамп обхода, а не про день 6.
+        logger.warning(
+            "--no-save относится к файлу результатов обхода; хранилища "
+            "--storage продолжают записывать страницы"
+        )
+
+    prefix = args.storage_path or str(
+        DEFAULT_OUTPUT_DIR / f"pages_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    storages: list[DataStorage] = []
+    for name in dict.fromkeys(args.storage):  # без повторов, порядок сохранён
+        path = Path(f"{prefix}{STORAGE_SUFFIXES[name]}")
+        batch = args.batch_size or DEFAULT_BATCH_SIZES[name]
+        if name == "json":
+            storages.append(JSONStorage(path, batch_size=batch))
+        elif name == "jsonl":
+            storages.append(JSONStorage(path, lines=True, batch_size=batch))
+        elif name == "csv":
+            storages.append(CSVStorage(path, batch_size=batch))
+        else:
+            storages.append(SQLiteStorage(path, batch_size=batch))
+
+    if len(storages) == 1:
+        return storages[0]
+    return MultiStorage(storages)
+
+
+async def show_saved(storage: DataStorage, limit: int = 5) -> None:
+    """Читает записанное обратно: данные должны не только сохраняться.
+
+    Перед чтением буфер досылается на диск — иначе последние страницы лежали бы
+    в памяти и в файле их бы не было.
+    """
+    await storage.flush()
+    children = (
+        storage.storages if isinstance(storage, MultiStorage) else [storage]
+    )
+
+    for child in children:
+        print()
+        rows = await child.load(limit=limit)
+        print(format_saved_sample(rows, f"  {child.name} -> {child.target}"))
+        if isinstance(child, SQLiteStorage):
+            found = await child.search("quote", limit=100)
+            print(
+                f"    Всего строк в базе: {await child.count()}"
+                f" | найдено по слову «quote»: {len(found)}"
+            )
 
 
 async def run_parallel(urls: list[str], args: argparse.Namespace) -> CrawlStats:
@@ -500,9 +623,12 @@ async def run_retry(urls: list[str], args: argparse.Namespace) -> CrawlStats:
 async def run_parse(urls: list[str], args: argparse.Namespace) -> CrawlStats:
     print(f"\n=== Загрузка с парсингом (max_concurrent={args.max_concurrent}) ===")
     html_parser = HTMLParser(same_domain_only=args.same_domain)
+    storage = build_storage(args)
     async with AsyncCrawler(
         max_concurrent=args.max_concurrent,
         parser=html_parser,
+        storage=storage,
+        storage_save_failed=args.save_failed,
         **_crawler_kwargs(args),
     ) as crawler:
         pages = await crawler.fetch_and_parse_many(urls)
@@ -513,6 +639,10 @@ async def run_parse(urls: list[str], args: argparse.Namespace) -> CrawlStats:
 
         print()
         print(format_parse_stats(pages))
+        if storage is not None:
+            print(format_storage_stats(storage.get_stats(), "Сохранение"))
+            await show_saved(storage)
+            print()
         print(format_stats(crawler.stats, "Итог загрузки"))
         return crawler.stats
 
@@ -528,6 +658,9 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         f", пауза {args.min_delay:.2f} с, разброс {args.jitter:.2f} с"
         f", robots.txt {'учитывается' if args.respect_robots else 'игнорируется'}"
     )
+    storage = build_storage(args)
+    if storage is not None:
+        print(f"Сохранение: {storage.name} -> {storage.target}")
     # Парсер без same_domain_only: ссылки на внешние сайты остаются в данных
     # страницы, а до очереди их не пускает фильтр обхода.
     show_progress = args.progress_interval > 0
@@ -544,6 +677,8 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         user_agent=args.user_agent,
         user_agents=args.rotate_ua,
         parser=HTMLParser(),
+        storage=storage,
+        storage_save_failed=args.save_failed,
         **_crawler_kwargs(args),
     ) as crawler:
         pages = await crawler.crawl(
@@ -557,6 +692,10 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         )
         if show_progress:
             print()  # закрыть строку прогресса, которую печатали через \r
+        if storage is not None:
+            # Обход закончен, держать страницы в буфере больше незачем — и
+            # статистика ниже покажет окончательные цифры, а не «записей 0».
+            await storage.flush()
 
         crawl_stats = crawler.get_crawl_stats()
         print(format_depth_table(pages))
@@ -573,10 +712,13 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
             for url, rule in list(crawler.blocked_urls.items())[:5]:
                 print(f"    {url} -> {rule}")
 
+        if storage is not None:
+            await show_saved(storage)
+
         if not args.no_save:
             path = Path(args.output) if args.output else _default_output_path()
             saved = save_crawl_results(pages, crawl_stats, path)
-            print(f"  Данные сохранены: {saved}")
+            print(f"\n  Данные сохранены: {saved}")
 
         return crawler.stats
 
@@ -674,6 +816,15 @@ def _warn_unused_politeness(args: argparse.Namespace) -> None:
         )
 
 
+def _warn_unused_storage(args: argparse.Namespace) -> None:
+    """Предупреждает, что сохранять нечего: страницы в этом режиме не разбираются."""
+    if args.storage or args.save_failed:
+        logger.warning(
+            "Флаги сохранения (--storage, --save-failed) действуют в режимах "
+            "--crawl, --store и --parse: сохраняются разобранные страницы"
+        )
+
+
 def _default_output_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return DEFAULT_OUTPUT_DIR / f"crawl_{stamp}.json"
@@ -711,6 +862,7 @@ async def main(argv: list[str] | None = None) -> int:
         if args.robots:
             if args.crawl:
                 logger.warning("--robots и --crawl вместе: выполняется только --robots")
+            _warn_unused_storage(args)
             stats = await run_robots(urls, args)
         elif args.crawl:
             if args.parse:
@@ -725,6 +877,7 @@ async def main(argv: list[str] | None = None) -> int:
             stats = await run_crawl(urls, args)
         elif args.retry:
             _warn_unused_politeness(args)
+            _warn_unused_storage(args)
             stats = await run_retry(urls, args)
         elif args.parse:
             _warn_unused_politeness(args)
@@ -735,6 +888,7 @@ async def main(argv: list[str] | None = None) -> int:
             stats = await run_parse(urls, args)
         else:
             _warn_unused_politeness(args)
+            _warn_unused_storage(args)
             stats = await run_parallel(urls, args)
 
             if args.sequential:

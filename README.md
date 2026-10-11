@@ -46,7 +46,8 @@ second_task_crawler/
 │   ├── retry.py       # RetryStrategy — повторы с экспоненциальным backoff
 │   ├── circuit.py     # CircuitBreaker — отключение упавшего домена
 │   ├── filters.py     # UrlFilter — фильтрация URL для очереди
-│   ├── models.py      # FetchResult, CrawlStats
+│   ├── storage.py     # DataStorage: JSON, CSV, SQLite, MultiStorage
+│   ├── models.py      # FetchResult, PageRecord, CrawlStats
 │   ├── utils.py       # логирование, замер времени, вывод и сохранение
 │   └── main.py        # демо-скрипт
 ├── tests/
@@ -61,13 +62,16 @@ second_task_crawler/
 │   ├── test_errors.py     # тесты классификации ошибок
 │   ├── test_retry.py      # тесты стратегии повторов
 │   ├── test_circuit.py    # тесты circuit breaker
-│   └── test_retry_crawler.py  # тесты повторов в краулере
+│   ├── test_retry_crawler.py  # тесты повторов в краулере
+│   ├── test_storage.py        # тесты хранилищ данных
+│   └── test_storage_crawler.py  # тесты сохранения при обходе
 └── docs/
     ├── algorithm.md   # день 1: асинхронная загрузка
     ├── parsing.md     # день 2: парсинг HTML
     ├── queueing.md    # день 3: очередь, конкурентность, обход
     ├── politeness.md  # день 4: rate limiting и robots.txt
-    └── errors.md      # день 5: ошибки, повторы, circuit breaker
+    ├── errors.md      # день 5: ошибки, повторы, circuit breaker
+    └── storage.md     # день 6: сохранение в файлы и базу
 ```
 
 ## 🚀 Как запустить
@@ -130,6 +134,18 @@ python -m src.main --crawl --max-pages 6 --circuit-breaker --circuit-threshold 3
 ```
 
 Отчёт об ошибках режима `--retry` складывается в `data/errors_<время>.json`.
+
+Демонстрация сохранения данных (день 6):
+
+```bash
+python -m src.main --store                 # обход + JSON, CSV и SQLite + чтение данных обратно
+python -m src.main --store --max-pages 30 --batch-size 10
+python -m src.main --crawl --storage sqlite --max-pages 10
+python -m src.main --crawl --storage jsonl csv --storage-path data/my_crawl
+python -m src.main --parse --storage json --save-failed
+```
+
+Файлы хранилищ по умолчанию складываются в `data/pages_<время>.{json,csv,db}`.
 
 Тесты (работают оффлайн, поднимают локальный `aiohttp`-сервер):
 
@@ -404,3 +420,67 @@ asyncio.run(main())
 
 Подробности, формулы backoff и осознанные ограничения —
 в [docs/errors.md](docs/errors.md).
+
+## 🧩 Сохранение данных (День 6)
+
+```python
+import asyncio
+from src.crawler import AsyncCrawler
+from src.storage import JSONStorage, MultiStorage, SQLiteStorage
+
+
+async def main():
+    # Один формат...
+    json_storage = JSONStorage("results.json")
+    # ...или сразу несколько
+    storage = MultiStorage([json_storage, SQLiteStorage("crawler.db")])
+
+    crawler = AsyncCrawler(storage=storage)
+    await crawler.crawl(start_urls=["https://example.com"], max_pages=20)
+    await crawler.close()  # досылает буфер и закрывает хранилища
+
+    print(await json_storage.load(limit=5))
+
+
+asyncio.run(main())
+```
+
+Хранилища по умолчанию **не подключены**: писать файлы — не то решение, которое
+краулер принимает за пользователя. Сохраняются разобранные страницы, неудачные —
+только по просьбе (`storage_save_failed=True`).
+
+| Формат | Класс | Когда выбирать |
+| --- | --- | --- |
+| JSON-массив | `JSONStorage(path)` | прочитать данные целиком одной строкой кода |
+| JSONL | `JSONStorage(path, lines=True)` | длинный обход и дописывание между запусками |
+| CSV | `CSVStorage(path, encoding=...)` | открыть в редакторе, залить в таблицу |
+| SQLite | `SQLiteStorage(path)` | искать, фильтровать и обновлять страницы |
+| несколько сразу | `MultiStorage([...])` | одни данные нужны в разных видах |
+
+| Параметр | Смысл |
+| --- | --- |
+| `storage` | объект `DataStorage`, куда уходит каждая разобранная страница |
+| `storage_save_failed` | сохранять и неудачные страницы (по умолчанию нет) |
+| `close_storage` | закрывать хранилище вместе с краулером (по умолчанию да) |
+| `batch_size` | сколько записей копить перед записью (файлы 1, SQLite 50) |
+| `text_limit` | обрезать текст страницы до N символов |
+| `encoding`, `errors`, `delimiter` | кодировка и разделитель для CSV |
+| `lines`, `indent` | режим JSONL и отступы JSON |
+
+| Класс / метод | Назначение |
+| --- | --- |
+| `DataStorage.save(page)` | сохранить страницу; `False` вместо исключения при сбое (с батчем `True` значит «принято в буфер») |
+| `DataStorage.save_many(pages)` / `flush()` | записать пачку / досрочно сбросить буфер |
+| `DataStorage.load(limit)` | прочитать сохранённое обратно |
+| `DataStorage.close()` / `get_stats()` | дописать остаток и закрыть / статистика записи |
+| `SQLiteStorage.init_db()` | создать таблицу и индексы заранее |
+| `SQLiteStorage.count()` / `search(text)` | сколько страниц в базе / поиск по тексту |
+| `PageRecord.from_page(page)` | стандартная форма записи из словаря страницы |
+
+Ошибка записи не останавливает обход: она попадает в лог и в счётчик `failed`,
+а временные сбои (`OSError`) повторяются стратегией дня 5. `FetchResult` и
+страницы получили `content_type` и `fetched_at`, а `get_crawl_stats()` — раздел
+`storage`.
+
+Схема таблицы, цена батчей и осознанные ограничения —
+в [docs/storage.md](docs/storage.md).

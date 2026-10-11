@@ -22,6 +22,18 @@ LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
 
+def json_default(value: Any) -> str:
+    """Чем заменить объект, который `json` не умеет сам.
+
+    Дата записывается в ISO 8601: такую строку читают и Python, и SQLite, и
+    сортировка по ней совпадает с сортировкой по времени. Функция одна на весь
+    проект, чтобы время в дампе обхода и в хранилищах выглядело одинаково.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    return str(value)
+
+
 def setup_logging(level: str | int = "INFO", log_file: str | None = None) -> None:
     """Настраивает корневой логгер, переустанавливая хендлеры при повторном вызове."""
     handlers: list[logging.Handler] = [logging.StreamHandler()]
@@ -242,6 +254,9 @@ def format_crawl_stats(stats: dict[str, Any], title: str = "Итог обход�
     circuit: dict[str, Any] = stats.get("circuit") or {}
     if circuit.get("enabled"):
         lines.append(format_circuit_stats(circuit))
+    storage: dict[str, Any] = stats.get("storage") or {}
+    if storage.get("enabled"):
+        lines.append(format_storage_stats(storage))
 
     return "\n".join(lines)
 
@@ -375,6 +390,74 @@ def format_circuit_stats(
     return "\n".join(lines)
 
 
+def format_storage_stats(
+    stats: dict[str, Any], title: str = "  Сохранение"
+) -> str:
+    """Куда и сколько записано, во что обошлась запись и что не записалось."""
+    if not stats.get("enabled", True):
+        return f"{title}: не настроено"
+
+    lines = [
+        f"{title}: {stats.get('storage', '?')} -> {stats.get('target', '?')}"
+        f" (батч {stats.get('batch_size', 1)})",
+        f"    Записей: {stats.get('saved', 0)}"
+        f" | батчей {stats.get('batches', 0)}"
+        f" | в буфере {stats.get('buffered', 0)}"
+        f" | ошибок {stats.get('failed', 0)}"
+        f" | время записи {stats.get('write_time', 0.0):.2f} с",
+    ]
+    if size := stats.get("bytes"):
+        lines.append(f"    Размер файла: {_format_size(size)}")
+    if stats.get("retries"):
+        lines.append(
+            f"    Повторы записи: {stats['retries']}"
+            f" | помогли {stats.get('retry_success', 0)}"
+        )
+    if error := stats.get("last_error"):
+        lines.append(f"    Последняя ошибка: {error}")
+
+    # Вложенные хранилища MultiStorage: у каждого формата свои цифры.
+    for child in stats.get("storages") or []:
+        lines.append(
+            f"      {child.get('storage')} -> {child.get('target')}:"
+            f" записей {child.get('saved', 0)}"
+            f", ошибок {child.get('failed', 0)}"
+            + (f", в буфере {child['buffered']}" if child.get("buffered") else "")
+            + (f", {_format_size(child['bytes'])}" if child.get("bytes") else "")
+        )
+
+    return "\n".join(lines)
+
+
+def format_saved_sample(
+    rows: list[dict[str, Any]], title: str = "Прочитано из хранилища"
+) -> str:
+    """Таблица нескольких сохранённых записей — проверка, что их можно читать."""
+    header = f"{'URL':<45} {'Статус':>7} {'Ссылок':>7} {'Текст':>8}  Заголовок"
+    lines = [f"{title} ({len(rows)}):", header, "-" * len(header)]
+
+    for row in rows:
+        url = _shorten(str(row.get("url", "")), 45)
+        links = row.get("links")
+        text = row.get("text") or ""
+        lines.append(
+            f"{url:<45} {str(row.get('status_code') or '—'):>7}"
+            f" {len(links) if isinstance(links, list) else 0:>7}"
+            f" {len(text):>8}  {_shorten(str(row.get('title') or ''), 40)}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_size(size: int) -> str:
+    """Размер файла в человеческих единицах."""
+    if size < 1024:
+        return f"{size} Б"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} КБ"
+    return f"{size / (1024 * 1024):.1f} МБ"
+
+
 def format_error_report(
     report: dict[str, Any],
     title: str = "Ошибки",
@@ -431,7 +514,7 @@ def save_error_report(report: dict[str, Any], path: str | Path) -> Path:
         **report,
     }
     with target.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
 
     logger.info(
         "Отчёт об ошибках сохранён: %s (неудачных %s)", target, report.get("failed")
@@ -457,7 +540,7 @@ def save_crawl_results(
         "pages": pages,
     }
     with target.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
 
     logger.info("Результаты обхода сохранены: %s (%d страниц)", target, len(pages))
     return target

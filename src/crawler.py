@@ -9,6 +9,7 @@ import ssl
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from types import TracebackType
 from typing import Any
 
@@ -38,6 +39,7 @@ from src.queue import CrawlerQueue
 from src.ratelimit import RateLimiter
 from src.retry import RetryOutcome, RetryStrategy
 from src.robots import RobotsParser, RobotsResponse
+from src.storage import DataStorage
 from src.semaphore import SemaphoreManager
 
 logger = logging.getLogger(__name__)
@@ -129,6 +131,9 @@ class AsyncCrawler:
         circuit_threshold: int | None = None,
         circuit_window: float | None = None,
         circuit_recovery: float | None = None,
+        storage: DataStorage | None = None,
+        storage_save_failed: bool = False,
+        close_storage: bool = True,
         retry_strategy: RetryStrategy | None = None,
         breaker: CircuitBreaker | None = None,
         rate_limiter: RateLimiter | None = None,
@@ -228,6 +233,16 @@ class AsyncCrawler:
                 _fallback(circuit_window, 60.0),
                 _fallback(circuit_recovery, 30.0),
             )
+        # Сохранение (день 6). Хранилища нет по умолчанию: писать файлы — не то
+        # решение, которое краулер принимает за пользователя.
+        self.storage = storage
+        # Неудачные страницы в данные не идут: сохранять нечего, а причины
+        # сбоев и так лежат в отчёте об ошибках дня 5.
+        self.storage_save_failed = storage_save_failed
+        # Хранилище, переданное снаружи, обычно и закрывать нужно вместе с
+        # краулером: пример из задания заканчивается одним `crawler.close()`.
+        self.close_storage = close_storage
+
         # Ротация агентов: пустой список означает «всегда основной агент».
         self.user_agents = tuple(user_agents or ())
         self._ua_cycle = itertools.cycle(self.user_agents) if self.user_agents else None
@@ -395,6 +410,8 @@ class AsyncCrawler:
                         waited=waited,
                         user_agent=agent,
                         attempts=attempt,
+                        content_type=response.content_type,
+                        fetched_at=datetime.now(),
                     )
             except asyncio.CancelledError:
                 raise
@@ -581,6 +598,7 @@ class AsyncCrawler:
             user_agent=user_agent,
             attempts=outcome.attempts or error.attempts,
             retry_waited=outcome.waited,
+            fetched_at=datetime.now(),
         )
 
     @staticmethod
@@ -686,8 +704,16 @@ class AsyncCrawler:
         *,
         user_agent: str | None = None,
         robots_checked: bool = False,
+        depth: int = 0,
     ) -> tuple[FetchResult, dict[str, Any]]:
-        """Возвращает и `FetchResult` (для статистики), и разобранную страницу."""
+        """Возвращает и `FetchResult` (для статистики), и разобранную страницу.
+
+        Здесь же страница уходит в хранилище: через этот метод проходят все
+        разобранные страницы — и обход, и `fetch_and_parse_many`, — поэтому один
+        хук гарантирует, что каждая сохранится ровно один раз. Глубина нужна
+        именно поэтому: записать её в страницу позже, в воркере, было бы уже
+        поздно.
+        """
         result = await self.fetch_one(
             url, user_agent=user_agent, robots_checked=robots_checked
         )
@@ -708,7 +734,38 @@ class AsyncCrawler:
                 self._parse_failed(result, ParseError(f"{type(exc).__name__}: {exc}"))
                 page = empty_page(url)
 
-        return result, self._merge_result(page, result)
+        page = self._merge_result(page, result)
+        page["depth"] = depth
+        await self._store(page)
+        return result, page
+
+    async def _unexpected_page(
+        self, url: str, exc: BaseException, depth: int = 0
+    ) -> tuple[FetchResult, dict[str, Any]]:
+        """Результат и страница для сбоя, которого мы не предусмотрели.
+
+        Сюда попадает только то, что пробилось мимо всей обработки ошибок, —
+        такая страница тоже должна выглядеть как обычная неудачная и дойти до
+        хранилища, если неудачные просили сохранять.
+        """
+        result = self._unexpected(url, exc)
+        page = self._merge_result(empty_page(url), result)
+        page["depth"] = depth
+        await self._store(page)
+        return result, page
+
+    async def _store(self, page: dict[str, Any]) -> None:
+        """Отдаёт страницу хранилищу, если оно подключено.
+
+        Исключений не ждём и не ловим: `DataStorage.save` сам переживает свои
+        сбои, пишет их в лог и считает — обход из-за заполненного диска
+        останавливаться не должен.
+        """
+        if self.storage is None:
+            return
+        if not page.get("ok") and not self.storage_save_failed:
+            return
+        await self.storage.save(page)
 
     @staticmethod
     def _parse_failed(result: FetchResult, error: ParseError) -> None:
@@ -736,6 +793,8 @@ class AsyncCrawler:
             user_agent=result.user_agent,
             attempts=result.attempts,
             retry_waited=result.retry_waited,
+            content_type=result.content_type,
+            fetched_at=result.fetched_at,
         )
         return page
 
@@ -753,8 +812,7 @@ class AsyncCrawler:
         pages: list[dict[str, Any]] = []
         for url, item in zip(urls, raw, strict=True):
             if isinstance(item, BaseException):
-                result = self._unexpected(url, item)
-                page = self._merge_result(empty_page(url), result)
+                result, page = await self._unexpected_page(url, item)
             else:
                 result, page = item
             results.append(result)
@@ -944,15 +1002,16 @@ class AsyncCrawler:
                 depth = queue.depth_of(url)
                 try:
                     result, page = await self._fetch_and_parse(
-                        url, user_agent=user_agent, robots_checked=self.respect_robots
+                        url,
+                        user_agent=user_agent,
+                        robots_checked=self.respect_robots,
+                        depth=depth,
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # падение воркера не должно рвать обход
-                    result = self._unexpected(url, exc)
-                    page = self._merge_result(empty_page(url), result)
+                    result, page = await self._unexpected_page(url, exc, depth)
 
-                page["depth"] = depth
                 self.visited_urls.add(url)
                 self.results.append(result)
                 pages.append(page)
@@ -1089,6 +1148,11 @@ class AsyncCrawler:
                 if self.circuit is not None
                 else {"enabled": False}
             ),
+            storage=(
+                {**self.storage.get_stats(), "enabled": True}
+                if self.storage is not None
+                else {"enabled": False}
+            ),
             errors=self.get_error_report(),
         )
         return stats
@@ -1143,8 +1207,16 @@ class AsyncCrawler:
         }
 
     async def close(self) -> None:
-        """Закрывает сессию; повторный вызов безопасен."""
+        """Закрывает хранилище и сессию; повторный вызов безопасен."""
         self._closed = True
+        if self.storage is not None:
+            # Сначала данные: в буфере хранилища могут лежать последние
+            # страницы, и терять их из-за порядка закрытия нельзя. Если
+            # закрывать хранилище не просили, буфер всё равно досылается.
+            if self.close_storage:
+                await self.storage.close()
+            else:
+                await self.storage.flush()
         if self._session is not None and not self._session.closed:
             await self._session.close()
             # Даём коннектору завершить закрытие транспортов до выхода из loop.
