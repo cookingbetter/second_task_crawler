@@ -88,6 +88,9 @@ class RobotsRules:
     groups: dict[str, RobotsGroup] = field(default_factory=dict)
     status: int | None = None
     source: str = SOURCE_OK
+    # Адреса карт сайта из директив `Sitemap`: они относятся ко всему сайту, а
+    # не к группе агента, поэтому лежат рядом с группами, а не внутри них.
+    sitemaps: tuple[str, ...] = ()
 
     @classmethod
     def allow_all(cls, status: int | None = None, source: str = SOURCE_MISSING) -> RobotsRules:
@@ -157,6 +160,7 @@ class RobotsRules:
             "group": group.name if group else None,
             "rules": len(group.rules) if group else 0,
             "crawl_delay": self.crawl_delay_for(user_agent),
+            "sitemaps": list(self.sitemaps),
         }
 
 
@@ -201,6 +205,7 @@ def parse_robots(text: str, *, status: int | None = None) -> RobotsRules:
     """
     rules: dict[str, list[RobotRule]] = {}
     delays: dict[str, float] = {}
+    sitemaps: list[str] = []
     agents: list[str] = []
     collecting_agents = True
 
@@ -220,6 +225,15 @@ def parse_robots(text: str, *, status: int | None = None) -> RobotsRules:
             if value:
                 agents.append(value.lower())
                 rules.setdefault(value.lower(), [])
+            continue
+
+        if directive == "sitemap":
+            # Директива не про группы: она адресована всем и может стоять до
+            # первого User-agent. Поэтому и перечисление агентов она не
+            # закрывает — иначе строка Sitemap между двумя User-agent разбила
+            # бы одну группу на две.
+            if value and value not in sitemaps:
+                sitemaps.append(value)
             continue
 
         collecting_agents = False
@@ -249,13 +263,15 @@ def parse_robots(text: str, *, status: int | None = None) -> RobotsRules:
                 continue
             for agent in agents:
                 delays[agent] = delay
-        # Sitemap, Host и прочие директивы обхода не касаются.
+        # Host и прочие директивы обхода не касаются.
 
     groups = {
         agent: RobotsGroup(agent, tuple(agent_rules), delays.get(agent))
         for agent, agent_rules in rules.items()
     }
-    return RobotsRules(groups=groups, status=status, source=SOURCE_OK)
+    return RobotsRules(
+        groups=groups, status=status, source=SOURCE_OK, sitemaps=tuple(sitemaps)
+    )
 
 
 class RobotsParser:
@@ -365,6 +381,16 @@ class RobotsParser:
     def cached_rules(self, url: str) -> RobotsRules | None:
         """Правила сервера из кэша — нужны для отчётов, без загрузки."""
         return self._rules.get(origin_key(url))
+
+    async def sitemaps(self, url: str) -> list[str]:
+        """Адреса карт сайта из robots.txt, загружая файл при необходимости.
+
+        Карты объявляет сам сайт, и директива `Sitemap` — единственный
+        стандартный способ их найти. Проверка разрешений тут не нужна: мы
+        спрашиваем не «можно ли», а «что есть».
+        """
+        rules = await self._rules_for(url)
+        return list(rules.sitemaps)
 
     def reset_stats(self) -> None:
         """Обнуляет счётчики проверок; разобранные правила остаются в кэше."""

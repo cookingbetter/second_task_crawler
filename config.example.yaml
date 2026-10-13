@@ -1,0 +1,86 @@
+# Пример конфигурации краулера (День 7).
+#   python crawler.py --config config.example.yaml
+#
+# Разделы ниже нужны только для читаемости: набор ключей плоский, и любую
+# настройку можно записать прямо в корне файла. Имена совпадают с флагами CLI,
+# поэтому конфиг читается как сохранённая командная строка. Любой флаг,
+# переданный явно, сильнее того же ключа из конфига.
+
+# Откуда начинать. Можно перечислить адреса, можно взять их из карты сайта —
+# значение auto ищет карту в robots.txt, а если её там нет, пробует
+# /sitemap.xml. Нужно хотя бы одно из двух.
+start_urls:
+  - https://quotes.toscrape.com/
+# sitemaps: [auto]
+
+crawler:
+  max_pages: 30
+  max_depth: 2
+  max_concurrent: 5
+  max_per_domain: 3
+
+politeness:
+  # Лимит запросов в секунду; синоним — rate_limit. Пусто или 0 — без лимита.
+  rate_limit: 2.0
+  # Считать лимит общим на все домены, а не отдельным для каждого.
+  global_rate: false
+  min_delay: 0.5
+  jitter: 0.2
+  respect_robots: true
+  user_agent: AsyncCrawler/1.0 (+https://example.com/bot)
+  # Ротация агентов по кругу; правила robots.txt проверяются для каждого.
+  # rotate_ua: [AsyncCrawler/1.0, ResearchBot/0.3]
+
+timeouts:
+  timeout_total: 15.0
+  timeout_connect: 5.0
+  timeout_read: 10.0
+  # Во сколько раз растут таймауты с каждой попыткой (1 — не растут).
+  timeout_growth: 1.5
+
+retry:
+  max_retries: 2
+  retry_base_delay: 0.5
+  retry_backoff: 2.0
+  retry_max_delay: 30.0
+  # Отключать домен, который отдаёт одни ошибки.
+  circuit_breaker: false
+  circuit_threshold: 5
+  circuit_recovery: 30.0
+
+filters:
+  # Не выходить за домены стартовых URL.
+  same_domain: true
+  # Регулярные выражения: обходить только подходящие и никогда — исключённые.
+  include: []
+  exclude:
+    - /login
+    - /tag/
+
+storage_settings:
+  # Форматы сохранения страниц: json, jsonl, csv, sqlite.
+  storage:
+    - jsonl
+    - sqlite
+  # Путь без расширения; по умолчанию data/pages_<время>.
+  storage_path: data/demo
+  # Сколько записей копить перед записью; по умолчанию 1 для файлов, 50 для базы.
+  # batch_size: 50
+  # Сохранять и неудачные страницы.
+  save_failed: false
+
+logging:
+  log_level: INFO
+  log_file: logs/crawler.log
+  # Ротация: размер файла и сколько старых копий держать.
+  log_max_bytes: 5000000
+  log_backups: 3
+
+output:
+  # Единый JSON со страницами и статистикой обхода.
+  output: data/crawl.json
+  # Отчёты дня 7.
+  report_json: data/stats.json
+  report_html: data/report.html
+  # Как часто обновлять строку прогресса, с (0 — выключить).
+  progress_interval: 0.5

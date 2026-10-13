@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,16 @@ logger = logging.getLogger(__name__)
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
+FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# Ротация лога: 5 МБ на файл и три старых копии. Больше держать незачем —
+# разбор сбоя смотрит в последние записи, а не в прошлую неделю.
+LOG_MAX_BYTES = 5_000_000
+LOG_BACKUPS = 3
+
+# Прогресс-бар: ширина в символах и чем рисуется.
+BAR_WIDTH = 24
+BAR_DONE = "#"
+BAR_LEFT = "·"
 
 
 def json_default(value: Any) -> str:
@@ -34,19 +45,46 @@ def json_default(value: Any) -> str:
     return str(value)
 
 
-def setup_logging(level: str | int = "INFO", log_file: str | None = None) -> None:
-    """Настраивает корневой логгер, переустанавливая хендлеры при повторном вызове."""
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+def setup_logging(
+    level: str | int = "INFO",
+    log_file: str | None = None,
+    *,
+    max_bytes: int = LOG_MAX_BYTES,
+    backups: int = LOG_BACKUPS,
+    console: bool = True,
+) -> None:
+    """Настраивает корневой логгер, переустанавливая хендлеры при повторном вызове.
 
-    logging.basicConfig(
-        level=level,
-        format=LOG_FORMAT,
-        datefmt=DATE_FORMAT,
-        handlers=handlers,
-        force=True,
-    )
+    В файл пишется полная дата, в консоль — только время: в терминале день и
+    так известен, а в логе недельного запуска без даты не разобраться.
+
+    Файл ротируется по размеру (`max_bytes`, `backups` старых копий): длинный
+    обход на уровне DEBUG пишет десятки мегабайт, и без ротации лог однажды
+    займёт весь диск. `max_bytes=0` ротацию отключает.
+    """
+    handlers: list[logging.Handler] = []
+    if console:
+        stream = logging.StreamHandler()
+        stream.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+        handlers.append(stream)
+
+    if log_file:
+        target = Path(log_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        file_handler: logging.Handler = RotatingFileHandler(
+            target, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+        )
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=FILE_DATE_FORMAT))
+        handlers.append(file_handler)
+
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    if log_file:
+        logger.debug(
+            "Лог пишется в %s (ротация по %d байт, копий %d)",
+            log_file,
+            max_bytes,
+            backups,
+        )
 
 
 @dataclass(slots=True)
@@ -162,18 +200,51 @@ def format_parse_stats(pages: list[dict[str, Any]]) -> str:
     )
 
 
+def format_bar(percent: float, width: int = BAR_WIDTH) -> str:
+    """Полоска прогресса фиксированной ширины."""
+    filled = int(max(0.0, min(percent, 100.0)) / 100 * width)
+    return f"[{BAR_DONE * filled}{BAR_LEFT * (width - filled)}]"
+
+
+def format_eta(seconds: float) -> str:
+    """Остаток времени словами: секунды, минуты или часы."""
+    if seconds <= 0:
+        return "—"
+    if seconds < 1:
+        # «0 с» выглядит как «готово», хотя работа ещё идёт.
+        return "<1 с"
+    if seconds < 60:
+        return f"{seconds:.0f} с"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} мин"
+    return f"{seconds / 3600:.1f} ч"
+
+
 def format_progress(stats: dict[str, Any]) -> str:
     """Строка прогресса обхода: что сделано, что осталось, с какой скоростью.
 
-    Про вежливость пишется только когда она включена: иначе строка для дней 1-3
-    обросла бы нулями, которые ничего не значат.
+    Полоска и процент появляются только при известном пределе страниц: без него
+    знаменателя нет, и «процент выполнения» был бы выдумкой. Про вежливость
+    пишется только когда она включена: иначе строка для дней 1-3 обросла бы
+    нулями, которые ничего не значат.
     """
-    line = (
+    done = stats.get("processed", 0) + stats.get("failed", 0)
+    max_pages = stats.get("max_pages")
+    line = ""
+    if max_pages:
+        line = (
+            f"{format_bar(stats.get('percent', 0.0))}"
+            f" {stats.get('percent', 0.0):3.0f}%"
+            f" | {done}/{max_pages} "
+        )
+
+    line += (
         f"Страниц: {stats.get('processed', 0)}"
         f" | в очереди: {stats.get('pending', 0)}"
         f" | в работе: {stats.get('in_progress', 0)}"
         f" | ошибок: {stats.get('failed', 0)}"
         f" | {stats.get('pages_per_sec', 0.0):.1f} стр/с"
+        f" | осталось: {format_eta(stats.get('eta', 0.0))}"
         f" | глубина: {stats.get('max_depth_reached', 0)}"
     )
 
@@ -257,6 +328,9 @@ def format_crawl_stats(stats: dict[str, Any], title: str = "Итог обход�
     storage: dict[str, Any] = stats.get("storage") or {}
     if storage.get("enabled"):
         lines.append(format_storage_stats(storage))
+    sitemap: dict[str, Any] = stats.get("sitemap") or {}
+    if sitemap.get("enabled"):
+        lines.append(format_sitemap_stats(sitemap))
 
     return "\n".join(lines)
 
@@ -316,6 +390,10 @@ def format_robots_stats(
         f" | запрещено {stats.get('blocked', 0)}"
         + (f" (уникальных URL {blocked_urls})" if blocked_urls is not None else "")
         + f" | файлов загружено {stats.get('fetched', 0)}"
+        # Счётчик загрузок обнуляется в начале обхода, а правила остаются в
+        # кэше: без этой цифры вышло бы «загружено 0» при живом robots.txt,
+        # прочитанном ещё при поиске карты сайта.
+        f" (в кэше {stats.get('domains', 0)})"
         f" | нет файла {stats.get('missing', 0)}"
         f" | ошибок {stats.get('errors', 0)}"
     ]
@@ -427,6 +505,28 @@ def format_storage_stats(
         )
 
     return "\n".join(lines)
+
+
+def format_sitemap_stats(
+    stats: dict[str, Any], title: str = "  Карта сайта"
+) -> str:
+    """Сколько карт прочитано и сколько адресов они дали."""
+    if not stats.get("enabled", True):
+        return f"{title}: не использовалась"
+
+    line = (
+        f"{title}: файлов {stats.get('files', 0)}"
+        f" (индексов {stats.get('indexes', 0)})"
+        f" | адресов {stats.get('urls', 0)}"
+        f" | дублей {stats.get('duplicates', 0)}"
+        f" | ошибок {stats.get('errors', 0)}"
+    )
+    if stats.get("truncated"):
+        line += (
+            f"\n    Разбор оборван лимитами: глубина {stats.get('max_depth')}"
+            f", адресов {stats.get('max_urls')}"
+        )
+    return line
 
 
 def format_saved_sample(

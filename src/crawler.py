@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import io
 import itertools
 import logging
 import ssl
@@ -12,6 +14,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from types import TracebackType
 from typing import Any
+from urllib.parse import urljoin
 
 import aiohttp
 import certifi
@@ -39,6 +42,13 @@ from src.queue import CrawlerQueue
 from src.ratelimit import RateLimiter
 from src.retry import RetryOutcome, RetryStrategy
 from src.robots import RobotsParser, RobotsResponse
+from src.sitemap import (
+    SITEMAP_AUTO,
+    SitemapEntry,
+    SitemapParser,
+    SitemapResponse,
+    sort_by_priority,
+)
 from src.storage import DataStorage
 from src.semaphore import SemaphoreManager
 
@@ -48,6 +58,13 @@ CHUNK_SIZE = 64 * 1024
 DEFAULT_USER_AGENT = "AsyncCrawler/1.0 (+https://example.com/bot)"
 # robots.txt больше этого размера — уже не правила обхода, а чья-то ошибка.
 ROBOTS_MAX_BYTES = 500_000
+# Карта сайта бывает на десятки мегабайт, но у неё есть предел по стандарту —
+# 50 МБ в распакованном виде; столько в память краулера мы не берём.
+SITEMAP_MAX_BYTES = 10_000_000
+# Где карта лежит, если robots.txt о ней не сказал.
+DEFAULT_SITEMAP_PATH = "/sitemap.xml"
+# Первые байты gzip-архива: по ним видно сжатую карту (sitemap.xml.gz).
+GZIP_MAGIC = b"\x1f\x8b"
 # Классы ошибок, которые повтор не исправит: такие URL попадают в отчёт
 # постоянными.
 PERMANENT_CLASSES = frozenset({PermanentError.__name__, ParseError.__name__})
@@ -138,6 +155,7 @@ class AsyncCrawler:
         breaker: CircuitBreaker | None = None,
         rate_limiter: RateLimiter | None = None,
         robots: RobotsParser | None = None,
+        sitemap: SitemapParser | None = None,
         ssl_context: ssl.SSLContext | None = None,
         parser: HTMLParser | None = None,
     ) -> None:
@@ -196,6 +214,9 @@ class AsyncCrawler:
             user_agent=user_agent,
             allow_on_error=robots_allow_on_error,
         )
+        # Карты сайта (день 7). Сам по себе парсер ничего не загружает: он
+        # работает только когда стартовые URL просят взять из sitemap.
+        self.sitemap = sitemap or SitemapParser(self._fetch_sitemap)
 
         # Повторы (день 5). Включены по умолчанию и умеренно: временная ошибка
         # не должна стоить страницы, но и долбить сайт краулер не станет.
@@ -260,6 +281,7 @@ class AsyncCrawler:
         # Адреса, с которых страницы реально отдали (после редиректов).
         self._final_urls: set[str] = set()
         self._pages_started = 0
+        self._max_pages = 0
 
     async def __aenter__(self) -> AsyncCrawler:
         return self
@@ -485,41 +507,80 @@ class AsyncCrawler:
         )
 
     async def _fetch_robots_txt(self, robots_url: str) -> RobotsResponse:
-        """Загружает robots.txt для `RobotsParser`.
+        """Загружает robots.txt для `RobotsParser`."""
+        status, text, error = await self._fetch_plain(
+            robots_url, ROBOTS_MAX_BYTES, "robots.txt"
+        )
+        return RobotsResponse(status=status, text=text, error=error)
 
-        Запрос идёт мимо проверки robots.txt (иначе получилась бы рекурсия), но
-        через лимит скорости и семафоры: сам robots.txt — тоже запрос к сайту.
+    async def _fetch_sitemap(self, sitemap_url: str) -> SitemapResponse:
+        """Загружает карту сайта для `SitemapParser`."""
+        status, text, error = await self._fetch_plain(
+            sitemap_url, SITEMAP_MAX_BYTES, "карта сайта", gunzip=True
+        )
+        return SitemapResponse(status=status, text=text, error=error)
+
+    async def _fetch_plain(
+        self, url: str, max_bytes: int, what: str, *, gunzip: bool = False
+    ) -> tuple[int | None, str, str | None]:
+        """Простая загрузка служебного файла: статус, текст и ошибка.
+
+        Служебные файлы (robots.txt, карты сайта) идут мимо проверки robots.txt
+        — иначе для robots.txt получилась бы рекурсия, — но через лимит
+        скорости и семафоры: это такие же запросы к сайту. Повторов и разбора
+        ошибок тут нет: решение, что делать с недоступным файлом, принимает тот,
+        кто его просил.
+
+        `gunzip` распаковывает тело, если оно сжато: `sitemap.xml.gz` разрешён
+        спецификацией, и крупные сайты отдают карту только так. Сжатие
+        проверяется по самим байтам, а не по имени файла или заголовку:
+        встречается и `.gz` без заголовка, и заголовок без `.gz`.
         """
         session = self._get_session()
-        await self.rate_limiter.acquire(robots_url)
+        await self.rate_limiter.acquire(url)
 
-        async with self.semaphores.acquire(robots_url):
+        async with self.semaphores.acquire(url):
             try:
                 async with session.get(
-                    robots_url, headers={"User-Agent": self.user_agent}
+                    url, headers={"User-Agent": self.user_agent}
                 ) as response:
                     if response.status >= 400:
-                        return RobotsResponse(status=response.status)
+                        return response.status, "", None
 
                     chunks: list[bytes] = []
                     size = 0
                     async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                         chunks.append(chunk)
                         size += len(chunk)
-                        if size >= ROBOTS_MAX_BYTES:
-                            logger.warning("robots.txt обрезан: %s", robots_url)
+                        if size >= max_bytes:
+                            logger.warning("%s обрезан: %s", what, url)
                             break
-                    body = b"".join(chunks)[:ROBOTS_MAX_BYTES]
-                    return RobotsResponse(
-                        status=response.status,
-                        text=self._decode_body(body, response, robots_url),
+                    body = b"".join(chunks)[:max_bytes]
+                    if gunzip and body[:2] == GZIP_MAGIC:
+                        try:
+                            with gzip.GzipFile(fileobj=io.BytesIO(body)) as packed:
+                                # Читаем ровно до лимита, а не целиком:
+                                # повторяющийся XML сжимается в сотни раз, и
+                                # разрешённые 10 МБ архива развернулись бы в
+                                # гигабайты в памяти воркера.
+                                body = packed.read(max_bytes)
+                        except (OSError, EOFError) as exc:
+                            # Обычно это обрезанный по max_bytes архив: часть
+                            # данных есть, но распаковать её нечем.
+                            return response.status, "", f"не распаковался: {exc}"
+                        if len(body) >= max_bytes:
+                            logger.warning("%s обрезан при распаковке: %s", what, url)
+                    return (
+                        response.status,
+                        self._decode_body(body, response, url),
+                        None,
                     )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                return RobotsResponse(error="превышен таймаут")
+                return None, "", "превышен таймаут"
             except aiohttp.ClientError as exc:
-                return RobotsResponse(error=f"{type(exc).__name__}: {exc}")
+                return None, "", f"{type(exc).__name__}: {exc}"
 
     async def _read_body(
         self, response: aiohttp.ClientResponse, url: str
@@ -828,6 +889,64 @@ class AsyncCrawler:
         )
         return pages
 
+    async def discover_sitemaps(self, url: str) -> list[str]:
+        """Где у сайта карта: из robots.txt, иначе по стандартному адресу.
+
+        robots.txt загружается, даже когда `respect_robots` выключен: мы
+        спрашиваем не разрешение, а адрес карты, и другого стандартного способа
+        его узнать нет.
+        """
+        found = await self.robots.sitemaps(url)
+        if found:
+            # Стандарт требует в директиве абсолютный адрес, но относительный
+            # встречается — достроить его по адресу сайта дешевле, чем потерять
+            # карту целиком. Так же поступает и разбор <loc> в самой карте.
+            found = [urljoin(url, item) for item in found]
+            logger.info("Карты сайта из robots.txt (%d): %s", len(found), found[0])
+            return found
+
+        fallback = urljoin(url, DEFAULT_SITEMAP_PATH)
+        logger.info("В robots.txt карт нет, пробую %s", fallback)
+        return [fallback]
+
+    async def seeds_from_sitemaps(
+        self,
+        sitemap_urls: Iterable[str],
+        *,
+        base_urls: Iterable[str] = (),
+        limit: int | None = None,
+    ) -> list[str]:
+        """Стартовые URL из карт сайта, самые важные — первыми.
+
+        Вместо адреса карты можно передать `auto` — тогда карта ищется по
+        `base_urls` через `discover_sitemaps`.
+
+        Порядок задаёт `<priority>`: очередь обхода при равном приоритете
+        работает как FIFO, поэтому отсортированный список сохранит свой порядок
+        и менять сигнатуру `crawl()` не требуется.
+
+        Счётчики карты сбрасываются здесь, а не в `crawl()`, как у остальных
+        механизмов: карту читают до начала обхода, и сброс в `crawl()` стёр бы
+        её цифры из отчёта. Зато второй прогон не покажет файлы первого.
+        """
+        self.sitemap.reset_stats()
+        sources: list[str] = []
+        for item in sitemap_urls:
+            if item != SITEMAP_AUTO:
+                sources.append(item)
+                continue
+            for base in base_urls:
+                sources.extend(await self.discover_sitemaps(base))
+
+        entries: list[SitemapEntry] = await self.sitemap.fetch_entries(
+            dict.fromkeys(sources)  # без повторов, порядок сохранён
+        )
+        urls = [entry.loc for entry in sort_by_priority(entries)]
+        if limit is not None and len(urls) > limit:
+            logger.info("Из карты сайта взяты первые %d адресов из %d", limit, len(urls))
+            urls = urls[:limit]
+        return urls
+
     async def crawl(
         self,
         start_urls: list[str],
@@ -876,6 +995,9 @@ class AsyncCrawler:
         self._final_urls = set()
         self.results = []
         self._pages_started = 0
+        # Предел этого обхода нужен не воркерам, а статистике: без него
+        # невозможно посчитать ни процент выполнения, ни остаток времени.
+        self._max_pages = max_pages
         # Семафоры, лимитер и парсер robots.txt переиспользуются между обходами,
         # но их счётчики — нет: иначе второй обход показывал бы статистику
         # первого. Разобранные правила и шаг задержек при этом сохраняются.
@@ -1130,10 +1252,35 @@ class AsyncCrawler:
         except Exception as exc:
             logger.warning("Callback прогресса упал: %s: %s", type(exc).__name__, exc)
 
+    def _progress_estimate(self, stats: dict[str, Any]) -> dict[str, Any]:
+        """Процент выполнения и оценка остатка времени.
+
+        Остаток считается как `min(лимит страниц - сделано, в очереди + в
+        работе)`: обход заканчивается по тому пределу, который наступит раньше,
+        и честная оценка — меньшая из двух. Поэтому процент может расти
+        рывками: когда ссылок находится меньше, чем позволяет лимит, работы
+        внезапно остаётся меньше.
+        """
+        done = stats.get("processed", 0) + stats.get("failed", 0)
+        by_limit = max(self._max_pages - done, 0) if self._max_pages else None
+        by_queue = stats.get("pending", 0) + stats.get("in_progress", 0)
+        remaining = by_queue if by_limit is None else min(by_limit, by_queue)
+
+        total = done + remaining
+        rate = stats.get("pages_per_sec", 0.0)
+        return {
+            "max_pages": self._max_pages or None,
+            "remaining": remaining,
+            "percent": done / total * 100 if total else 100.0,
+            # Без скорости оценивать нечего: в начале обхода её ещё нет.
+            "eta": remaining / rate if rate > 0 and remaining else 0.0,
+        }
+
     def get_crawl_stats(self) -> dict[str, Any]:
         """Сводная статистика обхода: очередь, семафоры, вежливость, ошибки."""
         stats = self.queue.get_stats()
         stats.update(
+            **self._progress_estimate(stats),
             visited=len(self.visited_urls),
             pages_started=self._pages_started,
             skipped=dict(self.skipped),
@@ -1153,6 +1300,12 @@ class AsyncCrawler:
                 if self.storage is not None
                 else {"enabled": False}
             ),
+            # Карты сайта попадают в статистику только если их читали: обход по
+            # ссылкам ничего о них не знает.
+            sitemap={
+                **self.sitemap.get_stats(),
+                "enabled": bool(self.sitemap.files or self.sitemap.errors),
+            },
             errors=self.get_error_report(),
         )
         return stats

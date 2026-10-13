@@ -35,6 +35,8 @@ second_task_crawler/
 ├── README.md
 ├── requirements.txt
 ├── pytest.ini
+├── crawler.py         # точка входа из задания: python crawler.py --urls ...
+├── config.example.yaml  # пример конфигурации с комментариями
 ├── src/
 │   ├── crawler.py     # AsyncCrawler — HTTP-клиент и обход сайта
 │   ├── parser.py      # HTMLParser — парсинг HTML и извлечение данных
@@ -42,11 +44,16 @@ second_task_crawler/
 │   ├── semaphore.py   # SemaphoreManager — лимиты конкурентности
 │   ├── ratelimit.py   # RateLimiter — лимит скорости, задержки, backoff
 │   ├── robots.py      # RobotsParser — разбор и соблюдение robots.txt
+│   ├── sitemap.py     # SitemapParser — карты сайта и индексы карт
 │   ├── errors.py      # классификация ошибок: временные, постоянные, сетевые
 │   ├── retry.py       # RetryStrategy — повторы с экспоненциальным backoff
 │   ├── circuit.py     # CircuitBreaker — отключение упавшего домена
 │   ├── filters.py     # UrlFilter — фильтрация URL для очереди
 │   ├── storage.py     # DataStorage: JSON, CSV, SQLite, MultiStorage
+│   ├── config.py      # CrawlerConfig — конфигурация из YAML или JSON
+│   ├── stats.py       # CrawlerStats — статистика прогона, JSON и HTML-отчёт
+│   ├── advanced.py    # AdvancedCrawler — финальная интеграция всех дней
+│   ├── benchmark.py   # замер производительности против синхронного обхода
 │   ├── models.py      # FetchResult, PageRecord, CrawlStats
 │   ├── utils.py       # логирование, замер времени, вывод и сохранение
 │   └── main.py        # демо-скрипт
@@ -64,14 +71,21 @@ second_task_crawler/
 │   ├── test_circuit.py    # тесты circuit breaker
 │   ├── test_retry_crawler.py  # тесты повторов в краулере
 │   ├── test_storage.py        # тесты хранилищ данных
-│   └── test_storage_crawler.py  # тесты сохранения при обходе
+│   ├── test_storage_crawler.py  # тесты сохранения при обходе
+│   ├── test_sitemap.py        # тесты разбора карт сайта
+│   ├── test_sitemap_crawler.py  # тесты карт в связке с краулером
+│   ├── test_stats.py          # тесты статистики и отчётов
+│   ├── test_config.py         # тесты конфигурации
+│   ├── test_advanced.py       # тесты интеграции и слияния CLI с конфигом
+│   └── test_benchmark.py      # тесты методики замеров
 └── docs/
     ├── algorithm.md   # день 1: асинхронная загрузка
     ├── parsing.md     # день 2: парсинг HTML
     ├── queueing.md    # день 3: очередь, конкурентность, обход
     ├── politeness.md  # день 4: rate limiting и robots.txt
     ├── errors.md      # день 5: ошибки, повторы, circuit breaker
-    └── storage.md     # день 6: сохранение в файлы и базу
+    ├── storage.md     # день 6: сохранение в файлы и базу
+    └── advanced.md    # день 7: карты сайта, конфиг, отчёты, бенчмарк
 ```
 
 ## 🚀 Как запустить
@@ -146,6 +160,23 @@ python -m src.main --parse --storage json --save-failed
 ```
 
 Файлы хранилищ по умолчанию складываются в `data/pages_<время>.{json,csv,db}`.
+
+Продвинутые возможности и финальная интеграция (день 7):
+
+```bash
+python crawler.py --config config.example.yaml       # весь прогон по конфигурации
+python crawler.py --urls https://example.com --max-pages 100 --output results.json
+python -m src.main --advanced --sitemap auto --report data/report.html
+python -m src.main --crawl --sitemap https://www.sitemaps.org/sitemap.xml --max-pages 5
+python -m src.main --crawl --report data/report.html --stats-json data/stats.json
+python -m src.main --benchmark --benchmark-pages 100 500 1000
+python -m src.main --advanced --log-file logs/crawler.log --rate-limit 2
+```
+
+Корневой `crawler.py` — то же приложение, что `python -m src.main`, с одним
+отличием: без явного флага режима он обходит сайт через `AdvancedCrawler` (день
+7), а не загружает список адресов (день 1). Поэтому команда из задания
+обходит сайт и сохраняет результат, а не игнорирует два флага из трёх.
 
 Тесты (работают оффлайн, поднимают локальный `aiohttp`-сервер):
 
@@ -484,3 +515,167 @@ asyncio.run(main())
 
 Схема таблицы, цена батчей и осознанные ограничения —
 в [docs/storage.md](docs/storage.md).
+
+## 🧩 Продвинутые возможности (День 7)
+
+```python
+import asyncio
+from src.advanced import AdvancedCrawler
+
+
+async def main():
+    crawler = AdvancedCrawler.from_config("config.yaml")
+    await crawler.crawl()
+
+    stats = crawler.get_stats()
+    print(f"Обработано: {stats['total_pages']}")
+    print(f"Успешно: {stats['successful']}")
+    print(f"Ошибок: {stats['failed']}")
+
+    crawler.export_to_html_report("report.html")
+    await crawler.close()
+
+
+asyncio.run(main())
+```
+
+`AdvancedCrawler` — композиция, а не наследник `AsyncCrawler`: он решает, что
+обходить и что делать с результатом, а краулер остаётся библиотекой, которую
+можно взять без конфигов и отчётов. `from_config` настраивает ещё и
+логирование — это точка входа приложения; прямой конструктор корневой логгер не
+трогает.
+
+| Метод | Назначение |
+| --- | --- |
+| `AdvancedCrawler.from_config(path)` | собрать прогон по YAML или JSON |
+| `crawl(start_urls=None)` | обойти сайт: адреса из аргумента, карты сайта или конфига |
+| `resolve_start_urls()` | только выбор стартовых адресов, без обхода |
+| `get_stats()` | сводка словарём: `total_pages`, `successful`, `failed`, скорость, домены |
+| `export_to_json(file)` / `export_to_html_report(file)` | отчёты (путь можно взять из конфига) |
+| `export_reports()` | записать те отчёты, что заданы в конфигурации |
+| `close()` | закрыть хранилища и сессию (есть и `async with`) |
+
+### Карта сайта как источник адресов
+
+```python
+async with AsyncCrawler(parser=HTMLParser()) as crawler:
+    # Прямо по адресу карты...
+    urls = await crawler.sitemap.fetch_sitemap("https://example.com/sitemap.xml")
+    # ...или найти её самому и получить готовые стартовые адреса
+    seeds = await crawler.seeds_from_sitemaps(["auto"], base_urls=["https://example.com/"])
+```
+
+Индексные карты разворачиваются рекурсивно, сжатые (`sitemap.xml.gz`)
+распаковываются, адреса идут по убыванию `<priority>` (без него — 0.5 по
+спецификации), дубли отбрасываются. Пределы:
+10 МБ на файл карты — и до, и после распаковки, иначе крошечный архив
+развернулся бы в память гигабайтами, —
+глубина индексов 3, 50 файлов, 50 000 адресов и множество уже загруженных —
+карта, ссылающаяся сама на себя, загружается один раз. Запрос карты идёт мимо
+проверки robots.txt (иначе для самого robots.txt вышла бы рекурсия), но через
+лимит скорости и семафоры.
+
+| Метод | Назначение |
+| --- | --- |
+| `SitemapParser.fetch_sitemap(url)` | список адресов страниц из карты |
+| `SitemapParser.fetch_entries(urls)` | записи с `lastmod`, `changefreq`, `priority` |
+| `SitemapParser.get_stats()` | файлы, индексы, адреса, дубли, ошибки, `truncated` |
+| `AsyncCrawler.discover_sitemaps(url)` | карты из robots.txt или `/sitemap.xml` |
+| `AsyncCrawler.seeds_from_sitemaps(urls, base_urls=, limit=)` | стартовые адреса по приоритету |
+| `RobotsParser.sitemaps(url)` | адреса карт из директив `Sitemap:` |
+
+### Статистика и отчёты
+
+```python
+from src.stats import CrawlerStats
+
+stats = CrawlerStats.from_crawler(crawler, pages)
+print(stats.get_stats()["by_status"], stats.top_domains(limit=5))
+stats.export_to_json("data/stats.json")
+stats.export_to_html_report("data/report.html")
+```
+
+`CrawlStats` (день 1) — итог одной загрузки, `CrawlerStats` — отчёт по целому
+прогону: статус-коды, типы ошибок, глубина, типы содержимого, топ доменов,
+скорость, время и настройки, которыми прогон получен. Своего состояния класс не
+ведёт: тот же прогон можно посчитать дважды и получить тот же отчёт.
+
+HTML-отчёт — один самодостаточный файл: инлайновый CSS, диаграммы на `div`-ах,
+никакого JS и ни одной внешней ссылки, чтобы он открывался с диска и без сети.
+Всё пользовательское проходит через `html.escape`, таблица страниц обрезается
+до 50 строк.
+
+### Конфигурация
+
+```yaml
+start_urls:
+  - https://quotes.toscrape.com/
+# sitemaps: [auto]        # искать карту в robots.txt, иначе /sitemap.xml
+
+crawler:
+  max_pages: 30
+  max_depth: 2
+politeness:
+  rate_limit: 2.0         # синоним requests_per_second
+  respect_robots: true
+storage_settings:
+  storage: [jsonl, sqlite]
+  storage_path: data/demo
+output:
+  report_html: data/report.html
+```
+
+Полный пример с комментариями — [config.example.yaml](config.example.yaml).
+Разделы нужны только для читаемости: набор ключей плоский, имена совпадают с
+флагами CLI, поэтому конфиг читается как сохранённая командная строка.
+Неизвестный ключ — ошибка с подсказкой («`max_page`, похоже на `max_pages`»): с
+предупреждением опечатка стоила бы целого прогона. Одна настройка под двумя
+именами (`urls` и `start_urls`) тоже отвергается, а пути отчётов проверяются до
+начала обхода.
+
+Приоритет такой: **значение по умолчанию -> пресет -> конфигурация -> явный
+флаг**. `--config run.yaml --max-pages 7` оставит 7, а остальное возьмёт из
+файла. Пресеты (`--polite`, `--retry`, `--store`) заполняют только незаданные
+значения, поэтому `rate_limit` из файла сильнее пресетных 2 зап/с.
+
+### Новые флаги CLI
+
+| Флаг | Смысл |
+| --- | --- |
+| `--config FILE` | настройки из YAML или JSON; без других режимов включает `--advanced` |
+| `--advanced` | прогон через `AdvancedCrawler` с отчётами |
+| `--sitemap URL [URL ...]` | брать стартовые адреса из карты; `auto` — найти её по robots.txt |
+| `--rate-limit N` | синоним `--rps`: запросов в секунду на домен |
+| `--report FILE` | HTML-отчёт о прогоне |
+| `--stats-json FILE` | статистика прогона в JSON |
+| `--log-file FILE` | писать лог ещё и в файл, с ротацией |
+| `--log-max-bytes N`, `--log-backups N` | размер файла лога до ротации и число копий |
+| `--benchmark` | сравнить асинхронный обход с синхронным на локальном сайте |
+| `--benchmark-pages N [N ...]` | размеры для `--benchmark` (по умолчанию 100, 500, 1000) |
+
+Строка прогресса показывает бар, процент, скорость и ETA:
+
+```
+[#####################···]  88% | 7/8 Страниц: 7 | в очереди: 40 | в работе: 1 | 7.0 стр/с | осталось: 3 с
+```
+
+Остаток считается как `min(max_pages - сделано, в очереди + в работе)` — обход
+закончится по тому пределу, который наступит раньше, поэтому процент может
+расти рывками.
+
+### Производительность
+
+`python -m src.main --benchmark` поднимает локальный сайт нужного размера и
+обходит его дважды: пулом воркеров на `aiohttp` и последовательно на `urllib`.
+Задержка ответа (10 мс) изображает настоящий сайт — без неё замер показывал бы
+только накладные расходы asyncio.
+
+| Страниц | Синхронно | Асинхронно | Ускорение |
+| --- | --- | --- | --- |
+| 100 | 1.57 с (63 стр/с) | 0.51 с (196 стр/с) | x3.1 |
+| 300 | 4.84 с (62 стр/с) | 0.84 с (357 стр/с) | x5.8 |
+
+Устройство карт сайта и их пределы, состав статистики, сборка HTML-отчёта,
+справочник ключей конфигурации, формула ETA, методика замеров и осознанные
+ограничения (прокси, cookies, JS-рендеринг, распределённый обход) —
+в [docs/advanced.md](docs/advanced.md).

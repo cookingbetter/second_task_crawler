@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 from collections import Counter
 from collections.abc import AsyncIterator, Callable
 
@@ -92,6 +93,65 @@ SITE_LINKS: dict[str, list[str]] = {
 }
 REDIRECT_PATH = "/site/redirect"
 REDIRECT_TARGET = "/site/b1"
+
+# Карты сайта. Приоритеты заданы вразнобой, чтобы было видно сортировку:
+# ожидаемый порядок — /site/b, /site/a1, /site/ (по умолчанию 0.5), /site/a.
+SITEMAP_PATH = "/sitemap.xml"
+SITEMAP_GZ_PATH = "/sitemap-gz.xml.gz"
+SITEMAP_INDEX_PATH = "/sitemap-index.xml"
+SITEMAP_PARTS = ("/sitemap-part1.xml", "/sitemap-part2.xml")
+SITEMAP_BROKEN_PATH = "/sitemap-broken.xml"
+SITEMAP_EMPTY_PATH = "/sitemap-empty.xml"
+SITEMAP_LOOP_PATH = "/sitemap-loop.xml"
+SITEMAP_MISSING_PATH = "/sitemap-missing.xml"
+SITEMAP_BOMB_PATH = "/sitemap-bomb.xml.gz"
+# Адресов в сжатой карте: при x200 сжатия крошечный архив разворачивается в
+# сотни килобайт — этого хватает, чтобы перебить уменьшенный в тесте лимит.
+SITEMAP_BOMB_URLS = 5_000
+
+SITEMAP_ENTRIES: tuple[tuple[str, str | None], ...] = (
+    ("/site/a", "0.1"),
+    ("/site/b", "0.9"),
+    ("/site/", None),
+    ("/site/a1", "0.7"),
+)
+# Полный порядок с учётом относительного адреса (priority 0.4).
+SITEMAP_ORDER = ("/site/b", "/site/a1", "/site/", "/site/b1", "/site/a")
+
+
+def _url_tag(loc: str, priority: str | None) -> str:
+    """Один <url> карты сайта; у первого адреса ещё и картинка с тем же <loc>."""
+    extra = (
+        f"<image:image><image:loc>{loc}/logo.png</image:loc></image:image>"
+        if priority == "0.1"
+        else ""
+    )
+    tail = f"<priority>{priority}</priority>" if priority is not None else ""
+    return (
+        f"<url><loc>{loc}</loc><lastmod>2026-01-02</lastmod>"
+        f"<changefreq>daily</changefreq>{tail}{extra}</url>"
+    )
+
+
+def _urlset(*entries: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+        ' xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">'
+        f"{''.join(entries)}</urlset>"
+    )
+
+
+def _sitemapindex(*locs: str) -> str:
+    inner = "".join(
+        f"<sitemap><loc>{loc}</loc><lastmod>2026-01-02</lastmod></sitemap>"
+        for loc in locs
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{inner}</sitemapindex>"
+    )
 
 
 async def handle_ok(request: web.Request) -> web.Response:
@@ -213,6 +273,91 @@ async def handle_site(request: web.Request) -> web.Response:
     return web.Response(text=body, content_type="text/html")
 
 
+async def handle_sitemap(request: web.Request) -> web.Response:
+    """Обычная карта сайта: абсолютные адреса, один относительный и дубль."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    entries = [
+        _url_tag(f"{origin}{path}", priority) for path, priority in SITEMAP_ENTRIES
+    ]
+    # Относительный <loc> встречается в живых картах, хотя стандарт требует
+    # абсолютный: он должен достроиться по адресу самой карты.
+    entries.append(_url_tag("site/b1", "0.4"))
+    # Дубль первого адреса: карта не должна отдать его дважды.
+    entries.append(_url_tag(f"{origin}/site/a", "0.1"))
+    return web.Response(text=_urlset(*entries), content_type="application/xml")
+
+
+async def handle_sitemap_gz(request: web.Request) -> web.Response:
+    """Сжатая карта: крупные сайты отдают только такие."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    body = gzip.compress(
+        _urlset(_url_tag(f"{origin}/site/a1", "0.6")).encode("utf-8")
+    )
+    return web.Response(body=body, content_type="application/x-gzip")
+
+
+async def handle_sitemap_bomb(request: web.Request) -> web.Response:
+    """Маленький архив с огромным содержимым: проверка лимита на распаковку."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    entries = [
+        _url_tag(f"{origin}/site/page{number}", "0.5")
+        for number in range(SITEMAP_BOMB_URLS)
+    ]
+    body = gzip.compress(_urlset(*entries).encode("utf-8"))
+    return web.Response(body=body, content_type="application/x-gzip")
+
+
+async def handle_sitemap_part(request: web.Request) -> web.Response:
+    """Половина карты из индекса: по одному адресу на файл."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    page = "/site/a" if request.path == SITEMAP_PARTS[0] else "/site/b"
+    return web.Response(
+        text=_urlset(_url_tag(f"{origin}{page}", "0.5")),
+        content_type="application/xml",
+    )
+
+
+async def handle_sitemap_index(request: web.Request) -> web.Response:
+    """Индекс карт: две рабочие части и одна отсутствующая."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    return web.Response(
+        text=_sitemapindex(
+            *(f"{origin}{part}" for part in SITEMAP_PARTS),
+            f"{origin}{SITEMAP_MISSING_PATH}",
+        ),
+        content_type="application/xml",
+    )
+
+
+async def handle_sitemap_loop(request: web.Request) -> web.Response:
+    """Индекс, ссылающийся на себя: защита от бесконечного обхода."""
+    request.app[HITS_KEY][request.path] += 1
+    origin = str(request.url.origin())
+    return web.Response(
+        text=_sitemapindex(f"{origin}{SITEMAP_LOOP_PATH}"),
+        content_type="application/xml",
+    )
+
+
+async def handle_sitemap_broken(request: web.Request) -> web.Response:
+    """Не XML, а обрывок: разбор не должен уронить краулер."""
+    request.app[HITS_KEY][request.path] += 1
+    return web.Response(
+        text="<urlset><url><loc>/site/a</loc", content_type="application/xml"
+    )
+
+
+async def handle_sitemap_empty(request: web.Request) -> web.Response:
+    """Корректная, но пустая карта."""
+    request.app[HITS_KEY][request.path] += 1
+    return web.Response(text=_urlset(), content_type="application/xml")
+
+
 @pytest.fixture
 async def server() -> AsyncIterator[TestServer]:
     """Поднимает aiohttp-приложение на случайном порту на время теста."""
@@ -235,6 +380,15 @@ async def server() -> AsyncIterator[TestServer]:
     app.router.add_get("/site/", handle_site)
     app.router.add_get(REDIRECT_PATH, handle_redirect)
     app.router.add_get("/site/{page}", handle_site)
+    app.router.add_get(SITEMAP_PATH, handle_sitemap)
+    app.router.add_get(SITEMAP_GZ_PATH, handle_sitemap_gz)
+    app.router.add_get(SITEMAP_BOMB_PATH, handle_sitemap_bomb)
+    app.router.add_get(SITEMAP_INDEX_PATH, handle_sitemap_index)
+    for part in SITEMAP_PARTS:
+        app.router.add_get(part, handle_sitemap_part)
+    app.router.add_get(SITEMAP_LOOP_PATH, handle_sitemap_loop)
+    app.router.add_get(SITEMAP_BROKEN_PATH, handle_sitemap_broken)
+    app.router.add_get(SITEMAP_EMPTY_PATH, handle_sitemap_empty)
 
     test_server = TestServer(app)
     await test_server.start_server()

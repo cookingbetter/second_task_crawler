@@ -1,27 +1,37 @@
 """Демо AsyncCrawler: загрузка (день 1), парсинг (день 2), обход (день 3),
-соблюдение правил вежливости (день 4), повторы при ошибках (день 5) и
-сохранение данных в файлы и базу (день 6)."""
+соблюдение правил вежливости (день 4), повторы при ошибках (день 5),
+сохранение данных в файлы и базу (день 6) и продвинутые возможности с
+конфигурацией и отчётами (день 7)."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from src.advanced import AdvancedCrawler
+from src.benchmark import DEFAULT_SIZES, format_benchmark_table, run_benchmark
+from src.config import (
+    DEFAULT_BATCH_SIZES,
+    DEFAULT_OUTPUT_DIR,
+    SITEMAP_AUTO,
+    STORAGE_SUFFIXES,
+    ConfigError,
+    CrawlerConfig,
+)
+from src.config import build_storage as build_storage_for
 from src.crawler import DEFAULT_USER_AGENT, AsyncCrawler
 from src.models import CrawlStats
 from src.parser import HTMLParser
-from src.storage import (
-    CSVStorage,
-    DataStorage,
-    JSONStorage,
-    MultiStorage,
-    SQLiteStorage,
-)
+from src.stats import CrawlerStats
+from src.storage import DataStorage, MultiStorage, SQLiteStorage
 from src.utils import (
+    LOG_BACKUPS,
+    LOG_MAX_BYTES,
     format_circuit_stats,
     format_crawl_stats,
     format_error_report,
@@ -31,6 +41,7 @@ from src.utils import (
     format_retry_stats,
     format_robots_stats,
     format_saved_sample,
+    format_sitemap_stats,
     format_stats,
     format_storage_stats,
     print_progress,
@@ -92,8 +103,6 @@ DEFAULT_RETRY_URLS = [
     "https://example.com",
 ]
 
-DEFAULT_OUTPUT_DIR = Path("data")
-
 # Пресет --polite: умеренный темп, пауза между запросами и разброс, чтобы поток
 # не выглядел машинным. Явно заданные флаги важнее пресета.
 POLITE_PRESET = {"rps": 2.0, "min_delay": 0.5, "jitter": 0.2}
@@ -110,17 +119,37 @@ RETRY_PRESET = {"timeout_total": 4.0, "timeout_read": 3.0, "retry_max_delay": 6.
 # Значения по умолчанию для флагов, которые пресеты могут переопределить.
 DEFAULT_RETRY_SETTINGS = {"retry_max_delay": 30.0}
 
-# Форматы сохранения (день 6) и расширения их файлов.
-STORAGE_SUFFIXES = {
-    "json": ".json",
-    "jsonl": ".jsonl",
-    "csv": ".csv",
-    "sqlite": ".db",
-}
 # Режим --store показывает три формата из задания; jsonl включают отдельно.
 STORE_PRESET_FORMATS = ("json", "csv", "sqlite")
-# Батчи по умолчанию: файлу незачем копить страницы, а базе — есть зачем.
-DEFAULT_BATCH_SIZES = {"json": 1, "jsonl": 1, "csv": 1, "sqlite": 50}
+
+# Настройки конфигурации и одноимённые флаги CLI называются одинаково, кроме
+# этих: у флагов имена из задания, у конфигурации — из библиотеки.
+CONFIG_TO_ARG = {
+    "start_urls": "urls",
+    "sitemaps": "sitemap",
+    "requests_per_second": "rps",
+    "report_html": "report",
+    "report_json": "stats_json",
+}
+# Флаги, которые включают свой режим: при них --config не превращается в
+# самостоятельный прогон, а только подставляет настройки.
+MODE_FLAGS = ("parse", "crawl", "robots", "retry", "store", "benchmark", "sequential")
+
+
+def default_mode_argv(argv: list[str] | None = None) -> list[str]:
+    """Аргументы для корневого `crawler.py`: без режима это обход дня 7.
+
+    У `python -m src.main` режим по умолчанию остаётся днём 1 — это демо семи
+    дней. А `crawler.py` — приложение, и команда из задания
+    `crawler.py --urls ... --max-pages 100 --output results.json` должна
+    обходить сайт и сохранять результат, а не загружать один адрес, молча
+    пропуская два флага из трёх.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    modes = {"--advanced", "--polite", "--config", *(f"--{name}" for name in MODE_FLAGS)}
+    if any(arg.split("=", 1)[0] in modes for arg in args):
+        return args
+    return [*args, "--advanced"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -221,6 +250,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--rps",
+        "--rate-limit",
+        dest="rps",
         type=float,
         help="лимит скорости, запросов в секунду на домен (0 — без лимита)",
     )
@@ -376,13 +407,82 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="сохранять в хранилище и неудачные страницы (по умолчанию нет)",
     )
     parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help=(
+            "конфигурация YAML или JSON (день 7); явные флаги сильнее её, "
+            "а без других режимов включает --advanced"
+        ),
+    )
+    parser.add_argument(
+        "--advanced",
+        action="store_true",
+        help="режим дня 7: обход через AdvancedCrawler с отчётами",
+    )
+    parser.add_argument(
+        "--sitemap",
+        nargs="+",
+        metavar="URL",
+        help=(
+            f"брать стартовые URL из карты сайта; {SITEMAP_AUTO} — найти её "
+            "по robots.txt"
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        metavar="FILE",
+        help="сохранить HTML-отчёт о прогоне (день 7)",
+    )
+    parser.add_argument(
+        "--stats-json",
+        metavar="FILE",
+        help="сохранить статистику прогона в JSON (день 7)",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help=(
+            "режим дня 7: сравнить асинхронный обход с синхронным на локальном "
+            "сайте и замерить память"
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-pages",
+        nargs="+",
+        type=int,
+        metavar="N",
+        help=(
+            "размеры для --benchmark, страниц (по умолчанию "
+            f"{' '.join(str(size) for size in DEFAULT_SIZES)})"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="уровень логирования",
     )
+    parser.add_argument(
+        "--log-file",
+        help="писать лог ещё и в файл (с ротацией по размеру)",
+    )
+    parser.add_argument(
+        "--log-max-bytes",
+        type=int,
+        default=LOG_MAX_BYTES,
+        help=f"размер файла лога до ротации, байт (по умолчанию {LOG_MAX_BYTES})",
+    )
+    parser.add_argument(
+        "--log-backups",
+        type=int,
+        default=LOG_BACKUPS,
+        help=f"сколько старых логов хранить (по умолчанию {LOG_BACKUPS})",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.config:
+        _apply_config(parser, args)
 
     # Проверяем здесь, чтобы пользователь получил понятное сообщение argparse,
     # а не трейсбек ValueError из глубины краулера.
@@ -400,6 +500,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--progress-interval не может быть отрицательным")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error(f"--batch-size должен быть >= 1, получено {args.batch_size}")
+    for name, value in (
+        ("--output", args.output),
+        ("--report", args.report),
+        ("--stats-json", args.stats_json),
+        ("--log-file", args.log_file),
+    ):
+        # Иначе запись упала бы трейсбеком в самом конце прогона.
+        if value and Path(value).is_dir():
+            parser.error(f"{name}: {value} — это каталог, нужен файл")
+    if args.log_max_bytes < 0:
+        parser.error("--log-max-bytes не может быть отрицательным")
+    if args.log_backups < 0:
+        parser.error("--log-backups не может быть отрицательным")
+    for size in args.benchmark_pages or ():
+        if size < 1:
+            parser.error(f"--benchmark-pages: размер должен быть >= 1, получено {size}")
     if args.retry_backoff < 1:
         parser.error(f"--retry-backoff должен быть >= 1, получено {args.retry_backoff}")
     if args.timeout_growth < 1:
@@ -422,6 +538,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.crawl = True
         if not args.storage:
             args.storage = list(STORE_PRESET_FORMATS)
+
+    if args.config and not any(getattr(args, flag) for flag in MODE_FLAGS):
+        # Конфигурация описывает прогон целиком, поэтому сама по себе означает
+        # обход дня 7. С любым другим режимом она остаётся просто настройками.
+        args.advanced = True
 
     if args.retry:
         # Короткие таймауты нужны самому режиму, но явный флаг сильнее пресета.
@@ -475,6 +596,86 @@ def _crawler_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _apply_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Подставляет в аргументы настройки из файла конфигурации.
+
+    Применяются только ключи, которые действительно были в файле, и только там,
+    где флаг оставлен по умолчанию: явная команда всегда сильнее файла. Порядок
+    получается такой: значение по умолчанию -> конфигурация -> флаг.
+    """
+    try:
+        config = CrawlerConfig.from_file(args.config)
+    except ConfigError as exc:
+        parser.error(f"--config: {exc}")
+        return
+
+    applied: list[str] = []
+    for name in sorted(config.provided):
+        dest = CONFIG_TO_ARG.get(name, name)
+        if not hasattr(args, dest) or getattr(args, dest) != parser.get_default(dest):
+            continue
+        setattr(args, dest, getattr(config, name))
+        applied.append(dest)
+
+    logger.debug(
+        "Из %s применено настроек: %s", args.config, ", ".join(applied) or "ни одной"
+    )
+
+
+def config_from_args(args: argparse.Namespace, urls: list[str]) -> CrawlerConfig:
+    """Собирает конфигурацию дня 7 из уже разобранных аргументов.
+
+    Нужна режиму --advanced: `AdvancedCrawler` работает от конфигурации, а не
+    от `Namespace`, и после слияния с файлом в аргументах лежит итоговый набор
+    настроек. Проверку значений делает сама `CrawlerConfig` — одна на оба входа.
+    """
+    data = {
+        "start_urls": urls,
+        "sitemaps": args.sitemap or [],
+        "max_pages": args.max_pages,
+        "max_depth": args.max_depth,
+        "max_concurrent": args.max_concurrent,
+        "max_per_domain": args.max_per_domain,
+        "requests_per_second": args.rps or None,
+        "global_rate": args.global_rate,
+        "min_delay": args.min_delay,
+        "jitter": args.jitter,
+        "max_backoff": args.max_backoff,
+        "respect_robots": args.respect_robots,
+        "user_agent": args.user_agent,
+        "rotate_ua": args.rotate_ua or [],
+        "timeout_total": args.timeout_total,
+        "timeout_connect": args.timeout_connect,
+        "timeout_read": args.timeout_read,
+        "timeout_growth": args.timeout_growth,
+        "max_retries": args.max_retries,
+        "retry_base_delay": args.retry_base_delay,
+        "retry_backoff": args.retry_backoff,
+        "retry_max_delay": args.retry_max_delay,
+        "circuit_breaker": args.circuit_breaker,
+        "circuit_threshold": args.circuit_threshold,
+        "circuit_recovery": args.circuit_recovery,
+        "same_domain": args.same_domain,
+        "include": args.include or [],
+        "exclude": args.exclude or [],
+        "storage": args.storage or [],
+        "storage_path": args.storage_path,
+        "batch_size": args.batch_size,
+        "save_failed": args.save_failed,
+        "log_level": args.log_level,
+        "log_file": args.log_file,
+        "log_max_bytes": args.log_max_bytes,
+        "log_backups": args.log_backups,
+        "output": None if args.no_save else (args.output or str(_default_output_path())),
+        "report_html": args.report,
+        "report_json": args.stats_json,
+        "progress_interval": args.progress_interval,
+    }
+    return CrawlerConfig.from_dict(
+        data, source=args.config or "аргументы командной строки"
+    )
+
+
 def build_storage(args: argparse.Namespace) -> DataStorage | None:
     """Собирает хранилище по флагам: одно на формат, несколько — через MultiStorage."""
     if not args.storage:
@@ -487,25 +688,9 @@ def build_storage(args: argparse.Namespace) -> DataStorage | None:
             "--storage продолжают записывать страницы"
         )
 
-    prefix = args.storage_path or str(
-        DEFAULT_OUTPUT_DIR / f"pages_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return build_storage_for(
+        args.storage, prefix=args.storage_path, batch_size=args.batch_size
     )
-    storages: list[DataStorage] = []
-    for name in dict.fromkeys(args.storage):  # без повторов, порядок сохранён
-        path = Path(f"{prefix}{STORAGE_SUFFIXES[name]}")
-        batch = args.batch_size or DEFAULT_BATCH_SIZES[name]
-        if name == "json":
-            storages.append(JSONStorage(path, batch_size=batch))
-        elif name == "jsonl":
-            storages.append(JSONStorage(path, lines=True, batch_size=batch))
-        elif name == "csv":
-            storages.append(CSVStorage(path, batch_size=batch))
-        else:
-            storages.append(SQLiteStorage(path, batch_size=batch))
-
-    if len(storages) == 1:
-        return storages[0]
-    return MultiStorage(storages)
 
 
 async def show_saved(storage: DataStorage, limit: int = 5) -> None:
@@ -631,6 +816,7 @@ async def run_parse(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         storage_save_failed=args.save_failed,
         **_crawler_kwargs(args),
     ) as crawler:
+        started_at = datetime.now()
         pages = await crawler.fetch_and_parse_many(urls)
 
         for page in pages:
@@ -643,8 +829,114 @@ async def run_parse(urls: list[str], args: argparse.Namespace) -> CrawlStats:
             print(format_storage_stats(storage.get_stats(), "Сохранение"))
             await show_saved(storage)
             print()
+        if args.report or args.stats_json:
+            export_reports(
+                CrawlerStats.from_results(
+                    crawler.results,
+                    pages,
+                    # Обхода по ссылкам тут не было, но сохранение было — и в
+                    # отчёте о нём должно быть видно.
+                    {"storage": {**storage.get_stats(), "enabled": True}}
+                    if storage is not None
+                    else None,
+                    elapsed=crawler.stats.elapsed,
+                    started_at=started_at,
+                    title="Отчёт краулера: загрузка с парсингом",
+                ),
+                args,
+            )
         print(format_stats(crawler.stats, "Итог загрузки"))
         return crawler.stats
+
+
+def export_reports(stats: CrawlerStats, args: argparse.Namespace) -> None:
+    """Пишет отчёты дня 7, если их попросили флагами."""
+    print()
+    if args.stats_json:
+        print(f"  Статистика сохранена: {stats.export_to_json(args.stats_json)}")
+    if args.report:
+        print(f"  HTML-отчёт сохранён: {stats.export_to_html_report(args.report)}")
+
+
+async def run_advanced(urls: list[str], args: argparse.Namespace) -> CrawlStats:
+    """Режим дня 7: всё вместе — конфигурация, обход, сохранение, отчёты."""
+    config = config_from_args(args, urls)
+    print(
+        f"\n=== Обход через AdvancedCrawler (страниц до {config.max_pages}, "
+        f"глубина {config.max_depth}, конкурентность {config.max_concurrent}) ==="
+    )
+    print(f"Настройки: {config.source}")
+    if config.sitemaps:
+        print(f"Источник адресов: карта сайта ({', '.join(config.sitemaps)})")
+    if config.storage:
+        print(f"Сохранение: {', '.join(config.storage)}")
+
+    show_progress = config.progress_interval > 0
+    crawler = AdvancedCrawler(config)
+    try:
+        pages = await crawler.crawl(
+            on_progress=print_progress if show_progress else None
+        )
+        if show_progress:
+            print()  # закрыть строку прогресса, которую печатали через \r
+
+        stats = crawler.stats
+        print(format_depth_table(pages))
+        print()
+        print(format_crawl_stats(crawler.crawler.get_crawl_stats()))
+        print(
+            f"\n  Итог: обработано {stats.total_pages}"
+            f", успешно {stats.successful}"
+            f", ошибок {stats.failed}"
+            f" ({stats.pages_per_sec:.1f} стр/с)"
+        )
+
+        if crawler.storage is not None:
+            await show_saved(crawler.storage)
+
+        reports = crawler.export_reports()
+        if reports:
+            print()
+        for path in reports:
+            print(f"  Отчёт сохранён: {path}")
+        if config.output:
+            saved = save_crawl_results(
+                pages, crawler.crawler.get_crawl_stats(), config.output
+            )
+            print(f"  Данные сохранены: {saved}")
+
+        return crawler.crawler.stats
+    finally:
+        # Хранилище и сессия закрываются даже если обход прервали: буфер с
+        # последними страницами иначе остался бы в памяти.
+        await crawler.close()
+
+
+async def run_benchmark_mode(args: argparse.Namespace) -> CrawlStats:
+    """Режим дня 7: сравнение с синхронным краулером и замер памяти."""
+    sizes = args.benchmark_pages or list(DEFAULT_SIZES)
+    print(
+        f"\n=== Тест производительности (размеры: {', '.join(map(str, sizes))}"
+        f", конкурентность {args.max_concurrent}) ==="
+    )
+    print(
+        "Сайт поднимается локально, в этом же процессе: замер не зависит ни от "
+        "сети, ни от чужого сервера. Задержка ответа изображает настоящий сайт."
+    )
+
+    results = await run_benchmark(sizes, max_concurrent=args.max_concurrent)
+    print()
+    print(format_benchmark_table(results))
+    print(
+        "\nПамять — пик по tracemalloc, то есть аллокации Python: "
+        "буферы сокетов в неё не входят."
+    )
+
+    pages = sum(result.async_run.pages for result in results)
+    elapsed = sum(
+        result.async_run.elapsed + result.sync_run.elapsed for result in results
+    )
+    return CrawlStats(total=pages, succeeded=pages, failed=0, elapsed=elapsed)
 
 
 async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
@@ -681,6 +973,10 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         storage_save_failed=args.save_failed,
         **_crawler_kwargs(args),
     ) as crawler:
+        if args.sitemap:
+            urls = await _seeds_from_sitemap(crawler, args, urls)
+
+        started_at = datetime.now()
         pages = await crawler.crawl(
             start_urls=urls,
             max_pages=args.max_pages,
@@ -715,10 +1011,14 @@ async def run_crawl(urls: list[str], args: argparse.Namespace) -> CrawlStats:
         if storage is not None:
             await show_saved(storage)
 
+        if args.report or args.stats_json:
+            export_reports(
+                CrawlerStats.from_crawler(crawler, pages, started_at=started_at), args
+            )
         if not args.no_save:
             path = Path(args.output) if args.output else _default_output_path()
             saved = save_crawl_results(pages, crawl_stats, path)
-            print(f"\n  Данные сохранены: {saved}")
+            print(f"  Данные сохранены: {saved}")
 
         return crawler.stats
 
@@ -807,6 +1107,24 @@ def format_depth_table(pages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+async def _seeds_from_sitemap(
+    crawler: AsyncCrawler, args: argparse.Namespace, urls: list[str]
+) -> list[str]:
+    """Берёт стартовые адреса из карты сайта вместо ссылок со страниц."""
+    print(f"\nИсточник адресов: карта сайта ({', '.join(args.sitemap)})")
+    seeds = await crawler.seeds_from_sitemaps(
+        args.sitemap, base_urls=urls, limit=args.max_pages
+    )
+    print(format_sitemap_stats(crawler.sitemap.get_stats(), "  Карта сайта"))
+    if seeds:
+        print(f"  Стартовых URL из карты: {len(seeds)} (первый: {seeds[0]})")
+        return seeds
+
+    # Карты может не быть вовсе — обход начнём с того, что просили изначально.
+    print("  Карта сайта не дала адресов, начинаю с переданных URL")
+    return urls
+
+
 def _warn_unused_politeness(args: argparse.Namespace) -> None:
     """Предупреждает, что флаги дня 4 в режимах дней 1-2 ничего не делают."""
     if args.rps or args.min_delay or args.jitter or args.respect_robots or args.rotate_ua:
@@ -825,6 +1143,24 @@ def _warn_unused_storage(args: argparse.Namespace) -> None:
         )
 
 
+def _warn_unused_reports(args: argparse.Namespace) -> None:
+    """Предупреждает, что отчёты дня 7 в этом режиме собирать не из чего."""
+    if args.report or args.stats_json:
+        logger.warning(
+            "Отчёты (--report, --stats-json) собираются в режимах --advanced, "
+            "--crawl и --parse"
+        )
+
+
+def _warn_unused_sitemap(args: argparse.Namespace) -> None:
+    """Предупреждает, что карта сайта нужна только там, где есть обход."""
+    if args.sitemap:
+        logger.warning(
+            "--sitemap действует в режимах --advanced и --crawl: только там "
+            "он задаёт стартовые адреса"
+        )
+
+
 def _default_output_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return DEFAULT_OUTPUT_DIR / f"crawl_{stamp}.json"
@@ -837,11 +1173,16 @@ def _default_error_path() -> Path:
 
 async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    setup_logging(args.log_level)
+    setup_logging(
+        args.log_level,
+        args.log_file,
+        max_bytes=args.log_max_bytes,
+        backups=args.log_backups,
+    )
 
     if args.robots:
         default_urls = DEFAULT_ROBOTS_URLS
-    elif args.crawl:
+    elif args.crawl or args.advanced:
         default_urls = DEFAULT_CRAWL_URLS
     elif args.retry:
         default_urls = DEFAULT_RETRY_URLS
@@ -851,18 +1192,33 @@ async def main(argv: list[str] | None = None) -> int:
         default_urls = DEFAULT_URLS
     urls: list[str] = args.urls or default_urls
 
-    if args.robots:
+    if args.benchmark:
+        print("Тест производительности: сеть не нужна, сайт поднимается локально")
+    elif args.robots:
         print(f"URL для проверки: {len(urls)}")
-    elif args.crawl:
+    elif args.crawl or args.advanced:
         print(f"Стартовых URL: {len(urls)}")
     else:
         print(f"URL в очереди: {len(urls)}")
 
     with timer() as total:
-        if args.robots:
+        if args.benchmark:
+            _warn_unused_storage(args)
+            _warn_unused_reports(args)
+            _warn_unused_sitemap(args)
+            stats = await run_benchmark_mode(args)
+        elif args.advanced:
+            if args.crawl:
+                logger.warning(
+                    "--crawl в режиме --advanced избыточен: это тоже обход сайта"
+                )
+            stats = await run_advanced(urls, args)
+        elif args.robots:
             if args.crawl:
                 logger.warning("--robots и --crawl вместе: выполняется только --robots")
             _warn_unused_storage(args)
+            _warn_unused_reports(args)
+            _warn_unused_sitemap(args)
             stats = await run_robots(urls, args)
         elif args.crawl:
             if args.parse:
@@ -878,9 +1234,12 @@ async def main(argv: list[str] | None = None) -> int:
         elif args.retry:
             _warn_unused_politeness(args)
             _warn_unused_storage(args)
+            _warn_unused_reports(args)
+            _warn_unused_sitemap(args)
             stats = await run_retry(urls, args)
         elif args.parse:
             _warn_unused_politeness(args)
+            _warn_unused_sitemap(args)
             if args.sequential:
                 logger.warning(
                     "--sequential относится к режиму дня 1 и в --parse не действует"
@@ -889,6 +1248,8 @@ async def main(argv: list[str] | None = None) -> int:
         else:
             _warn_unused_politeness(args)
             _warn_unused_storage(args)
+            _warn_unused_reports(args)
+            _warn_unused_sitemap(args)
             stats = await run_parallel(urls, args)
 
             if args.sequential:
@@ -900,7 +1261,7 @@ async def main(argv: list[str] | None = None) -> int:
                         f"{stats.elapsed:.2f} с (x{speedup:.1f})"
                     )
 
-    print(f"Общее время работы: {total.seconds:.2f} с")
+    print(f"\nОбщее время работы: {total.seconds:.2f} с")
 
     if stats.succeeded == 0:
         print("\nНи одна страница не загружена — проверьте доступ в сеть.")

@@ -9,6 +9,7 @@ import pytest
 from src.crawler import AsyncCrawler
 from src.main import format_robots_table, parse_args
 from src.models import ERROR_ROBOTS
+from src.sitemap import SITEMAP_AUTO
 from src.utils import format_crawl_stats, format_progress, format_rate_stats
 
 # /site/a1 обычный обход загружает, поэтому запрет на него хорошо виден.
@@ -86,6 +87,25 @@ async def test_robots_txt_is_fetched_once_per_domain(url, agents, robots_txt):
 
     assert [path for path, _agent in agents].count("/robots.txt") == 1
     assert crawler.get_crawl_stats()["robots"]["fetched"] == 1
+
+
+async def test_cached_robots_visible_when_fetched_before_crawl(url, robots_txt):
+    """robots.txt читают и до обхода — ради карты сайта; это должно быть видно.
+
+    Счётчик загрузок обнуляется в начале `crawl`, а правила берутся из кэша,
+    поэтому одного `fetched` для отчёта не хватает.
+    """
+    robots_txt(f"User-agent: *\nSitemap: {url('/sitemap.xml')}\n")
+
+    async with AsyncCrawler(max_concurrent=2, respect_robots=True) as crawler:
+        seeds = await crawler.seeds_from_sitemaps(
+            [SITEMAP_AUTO], base_urls=[url("/site/")], limit=2
+        )
+        await crawler.crawl(seeds, max_pages=2, same_domain_only=True)
+        stats = crawler.get_crawl_stats()
+
+    assert (stats["robots"]["fetched"], stats["robots"]["domains"]) == (0, 1)
+    assert "файлов загружено 0 (в кэше 1)" in format_crawl_stats(stats)
 
 
 async def test_missing_robots_txt_allows_whole_site(url, robots_txt):
